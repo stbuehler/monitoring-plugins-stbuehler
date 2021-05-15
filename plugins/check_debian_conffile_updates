@@ -1,0 +1,44 @@
+#!/bin/bash
+#
+# Copyright: 2021 Stefan Bühler <stbuehler@web.de>
+# License: MIT
+
+set -e
+
+tmpdir=$(mktemp --tmpdir -d check_debian_conffile_updates-XXXXXXX)
+trap 'rm -rf "${tmpdir}"' EXIT
+
+exec 4>"${tmpdir}/info"
+
+list_conffile_updates() {
+	exec find /etc -xdev \( -name '*-old' -o -name '*-new' -o -name '*-dist' \) -print0
+}
+
+found=0
+result=0
+while IFS= read -u3 -d '' -r file; do
+	if [ "${found}" = 0 ]; then
+		found=1
+		echo >&4 "Found files:"
+	fi
+	case "${file}" in
+	*.dpkg-dist)
+		orig_file=${file%.dpkg-dist}
+		if [ ! -f "${orig_file}" ]; then
+			echo >&4 "  ${file} (ignored; looks disabled on purpose as ${orig_file} is missing)"
+			continue
+		fi
+		;;
+	esac
+	echo >&4 "  ${file}"
+	result=1
+done 3< <(list_conffile_updates)
+
+if [ "${result}" = 0 ]; then
+	echo "OK: No config updates pending||"
+else
+	echo "WARNING: pending config updates||"
+fi
+cat "${tmpdir}/info"
+
+exit "${result}"

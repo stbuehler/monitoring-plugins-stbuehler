@@ -1,0 +1,28 @@
+#!/bin/bash
+#
+# Copyright: 2021 Stefan Bühler <stbuehler@web.de>
+# License: MIT
+
+set -e
+
+tmpdir=$(mktemp --tmpdir -d check_systemd_failed_units-XXXXXXX)
+trap 'rm -rf "${tmpdir}"' EXIT
+
+exec 4>"${tmpdir}/info"
+
+failed_units=()
+result=0
+while read -u3 unit rem; do
+	result=2
+	failed_units+=("${unit}")
+	systemctl >&4 status --no-pager "${unit}" || /bin/true
+done 3< <(systemctl list-units --state=failed --full --plain --no-legend)
+
+if [ "${result}" = 0 ]; then
+	echo "OK: All systemd units are good||"
+else
+	echo "CRITICAL: Failed units: ${failed_units[@]}||"
+fi
+cat "${tmpdir}/info"
+
+exit "${result}"
