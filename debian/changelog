@@ -1,8 +1,8 @@
-monitoring-plugins-stbuehler (0.2) UNRELEASED; urgency=medium
+monitoring-plugins-stbuehler (0.2) unstable; urgency=medium
 
   * add check_dns_zone
 
- -- Stefan Bühler <source@stbuehler.de>  Wed, 04 May 2022 15:32:22 +0200
+ -- Stefan Bühler <source@stbuehler.de>  Wed, 04 May 2022 15:49:14 +0200
 
 monitoring-plugins-stbuehler (0.1) unstable; urgency=medium
 
