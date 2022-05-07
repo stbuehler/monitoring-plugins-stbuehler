@@ -404,6 +404,7 @@ async def main(ir: IcingaResult, opts: argparse.Namespace):
     main_soa: typing.Optional[dns.rdtypes.ANY.SOA.SOA] = None
 
     async def check_auth(ns_addr: IPAddress, ns_name: str) -> None:
+        nonlocal logged_expected_delegation
         l = lookup_servers.get(ns_addr)
         try:
             soa = (await l.soa(name))[0]
