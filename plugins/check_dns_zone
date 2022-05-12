@@ -523,9 +523,10 @@ async def main(ir: IcingaResult, opts: argparse.Namespace):
 if __name__ == '__main__':
     p = argparse.ArgumentParser(description="Check DNS zone (delegation, SOA, DNSSEC) on all authoritatives and hidden primary")
     p.add_argument('zone', help='Name of DNS zone to check')
-    p.add_argument('--skip-hidden-master', action='store_true')
+    p.add_argument('--skip-hidden-master', action='store_true', help="Don't verify hidden master data (might be blocked by a firewall)")
     p.add_argument('--auth-tcp', action='store_true', help="Use TCP for DNS queries to authoritative servers")
+    p.add_argument('--debug', action='store_true', help="Show debug output")
     opts = p.parse_args()
-    ir = IcingaResult() # (debug=True)
+    ir = IcingaResult(debug=opts.debug)
     trio.run(main, ir, opts)
     ir.finish()
