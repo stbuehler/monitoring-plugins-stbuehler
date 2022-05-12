@@ -279,20 +279,21 @@ class DnsLookup:
 
 
 class DnsLookupServersCache:
-    def __init__(self):
+    def __init__(self, *, tcp_only: bool=False):
         self._servers: typing.Dict[IPAddress, DnsLookup] = {}
+        self._tcp_only = tcp_only
 
     def get(self, address) -> DnsLookup:
         l = self._servers.get(address, None)
         if not l:
-            l = DnsLookup(server=address)
+            l = DnsLookup(server=address, tcp_only=self._tcp_only)
             self._servers[address] = l
         return l
 
 
 async def main(ir: IcingaResult, opts: argparse.Namespace):
     resolver = DnsLookup()
-    lookup_servers = DnsLookupServersCache()
+    lookup_servers = DnsLookupServersCache(tcp_only=opts.auth_tcp)
     name = dns.name.from_text(opts.zone)
     parent_ns_set = await resolver.find_parent_zone(name)
     ir.debug(f'NS for parent zone {parent_ns_set.name} of {name}: ' + ' '.join(str(ns.target) for ns in parent_ns_set))
@@ -523,6 +524,7 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description="Check DNS zone (delegation, SOA, DNSSEC) on all authoritatives and hidden primary")
     p.add_argument('zone', help='Name of DNS zone to check')
     p.add_argument('--skip-hidden-master', action='store_true')
+    p.add_argument('--auth-tcp', action='store_true', help="Use TCP for DNS queries to authoritative servers")
     opts = p.parse_args()
     ir = IcingaResult() # (debug=True)
     trio.run(main, ir, opts)
