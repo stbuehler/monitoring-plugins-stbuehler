@@ -2,8 +2,9 @@ monitoring-plugins-stbuehler (0.4) UNRELEASED; urgency=medium
 
   * check_dns_zone: add --auth-tcp flag
   * check_dns_zone: add --debug flag
+  * fix debian dependency: want dnspython, not dns
 
- -- Stefan Bühler <source@stbuehler.de>  Thu, 12 May 2022 12:07:58 +0200
+ -- Stefan Bühler <source@stbuehler.de>  Thu, 12 May 2022 12:14:40 +0200
 
 monitoring-plugins-stbuehler (0.3) unstable; urgency=medium
 
