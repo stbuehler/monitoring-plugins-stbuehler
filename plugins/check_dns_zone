@@ -310,7 +310,7 @@ async def main(ir: IcingaResult, opts: argparse.Namespace):
             return
         for addr in addresses:
             if addr in parent_addresses:
-                ir.warn(f'IP duplicate in NS set (known as {parent_addresses[addr]} and {parent_ns})')
+                ir.info(f'IP {addr} duplicate in NS set for {parent_ns_set.name} (known as {parent_addresses[addr]} and {parent_ns})')
             else:
                 parent_addresses[addr] = parent_ns
 
