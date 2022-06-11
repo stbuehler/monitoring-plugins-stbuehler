@@ -576,13 +576,14 @@ class CheckNameContext:
                     nursery.start_soon(self.check_dnskey, ns_addr, hm)
 
         for soa, sources in hm_soas.items():
+            # no need to print name for sources - there is only a single hidden primary
+            sources_str = ' '.join(map(str, sources))
             if self.main_soa != soa:
-                self.ir.error(f"Hidden primary SOA from {' '.join(sources)} mismatch for {self.name}")
+                self.ir.error(f"Hidden primary SOA from {sources_str} mismatch for {self.name}")
                 self.ir.log(f"Main authoritative SOA: {self.main_soa}")
-                # no need to print name for sources - there is only a single hidden primary
-                self.ir.log(f"Hidden primary SOA from {' '.join(sources)}: {soa}")
+                self.ir.log(f"Hidden primary SOA from {sources_str}: {soa}")
             else:
-                self.ir.debug(f"Hidden primary SOA from {' '.join(sources)} matches main SOA")
+                self.ir.debug(f"Hidden primary SOA from {sources_str} matches main SOA")
 
     _DIRECT_PRIVATE_ADDRESS_ZONES = {
         '10.in-addr.arpa',  # 10.0.0.0/8
@@ -643,7 +644,7 @@ class CheckNameContext:
                 nursery.start_soon(get_ns_addr, ns.target)
 
         if self.ir._debug:
-            self.ir.debug('Using delegation received from resolver for private zone {self.name}:')
+            self.ir.debug(f'Using delegation received from resolver for private zone {self.name}:')
             for ns, addrs in result.items():
                 self.ir.log(f'* NS {ns}: ' + ' '.join(map(str, addrs)))
 
