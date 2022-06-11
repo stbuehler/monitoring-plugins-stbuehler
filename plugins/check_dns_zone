@@ -499,6 +499,17 @@ async def main(ir: IcingaResult, opts: argparse.Namespace):
         for soa in soas:
             ir.log(f'* {name} SOA {soa}')
 
+    expect_auths = [
+        dns.name.from_text(auth.strip().lower())
+        for opt in (opts.expect_auth or [])
+        for auth in opt.split(',')
+    ]
+    for auth in expect_auths:
+        if not str(auth) in merged_delegation:
+            ir.error(f'Missing expected auth {auth} in NS set for {name}')
+        else:
+            ir.debug(f'Found expected auth {auth} in NS set for {name}')
+
     if main_soa and not str(main_soa.mname) in merged_delegation:
         hm = main_soa.mname
         ir.log(f'Found hidden master {hm}')
@@ -526,6 +537,7 @@ if __name__ == '__main__':
     p.add_argument('--skip-hidden-master', action='store_true', help="Don't verify hidden master data (might be blocked by a firewall)")
     p.add_argument('--auth-tcp', action='store_true', help="Use TCP for DNS queries to authoritative servers")
     p.add_argument('--debug', action='store_true', help="Show debug output")
+    p.add_argument('--expect-auth', action='append', help="Make sure listed servers are part of the NS set of the zone")
     opts = p.parse_args()
     ir = IcingaResult(debug=opts.debug)
     trio.run(main, ir, opts)
