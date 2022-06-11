@@ -297,7 +297,7 @@ class CheckNameContext:
         self.ir = ir
         self.opts = opts
         self.name = dns.name.from_text(opts.zone)
-        self.resolver = DnsLookup()
+        self.resolver = DnsLookup(server=opts.resolver)
         self.lookup_servers = DnsLookupServersCache(tcp_only=opts.auth_tcp)
 
         #### Values we fill during lookup ####
@@ -761,6 +761,7 @@ def main():
     p.add_argument('--private', action='store_true', help="Don't check the delegation (i.e. only SOA)")
     p.add_argument('--private-reverse', action='store_true', help="Don't check the delegation (i.e. only SOA), if the zone is an entry to the reverse zone for private IP addresses")
     p.add_argument('--private-entry', action='append', help="Mark given zone name(s) as entry to private zones where delegation isn't checked")
+    p.add_argument('--resolver', action='store', help="Use given address as DNS resolver")
     opts = p.parse_args()
     ir = IcingaResult(debug=opts.debug)
     trio.run(CheckNameContext(ir, opts).check)
