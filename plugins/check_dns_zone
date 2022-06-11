@@ -291,247 +291,252 @@ class DnsLookupServersCache:
         return l
 
 
-async def main(ir: IcingaResult, opts: argparse.Namespace):
-    resolver = DnsLookup()
-    lookup_servers = DnsLookupServersCache(tcp_only=opts.auth_tcp)
-    name = dns.name.from_text(opts.zone)
-    parent_ns_set = await resolver.find_parent_zone(name)
-    ir.debug(f'NS for parent zone {parent_ns_set.name} of {name}: ' + ' '.join(str(ns.target) for ns in parent_ns_set))
-    parent_addresses: typing.Dict[IPAddress, DomainName] = {}
+class CheckNameContext:
+    def __init__(self, ir: IcingaResult, opts: argparse.Namespace):
+        self.ir = ir
+        self.opts = opts
+        self.name = dns.name.from_text(opts.zone)
+        self.resolver = DnsLookup()
+        self.lookup_servers = DnsLookupServersCache(tcp_only=opts.auth_tcp)
 
-    async def get_parent_ns_addr(parent_ns: DomainName) -> None:
-        nonlocal parent_addresses
-        try:
-            addresses = await resolver.addresses(parent_ns)
-            ir.debug(f'Addresses of NS {parent_ns}: ' + ' '.join(str(addr) for addr in addresses))
-        except DnsException as e:
-            ir.error(f'Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_set.name} of {name}')
-            ir.error(str(e))
+    async def check(self):
+        parent_ns_set = await self.resolver.find_parent_zone(self.name)
+        self.ir.debug(f'NS for parent zone {parent_ns_set.name} of {self.name}: ' + ' '.join(str(ns.target) for ns in parent_ns_set))
+        parent_addresses: typing.Dict[IPAddress, DomainName] = {}
+
+        async def get_parent_ns_addr(parent_ns: DomainName) -> None:
+            nonlocal parent_addresses
+            try:
+                addresses = await self.resolver.addresses(parent_ns)
+                self.ir.debug(f'Addresses of NS {parent_ns}: ' + ' '.join(str(addr) for addr in addresses))
+            except DnsException as e:
+                self.ir.error(f'Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_set.name} of {self.name}')
+                self.ir.error(str(e))
+                return
+            for addr in addresses:
+                if addr in parent_addresses:
+                    self.ir.info(f'IP {addr} duplicate in NS set for {parent_ns_set.name} (known as {parent_addresses[addr]} and {parent_ns})')
+                else:
+                    parent_addresses[addr] = parent_ns
+
+        async with trio.open_nursery() as nursery:
+            for ns in parent_ns_set:
+                nursery.start_soon(get_parent_ns_addr, ns.target)
+
+        delegations: typing.Dict[Delegation, typing.List[IPAddress]] = {}
+        ds_sets: typing.Dict[typing.FrozenSet[dns.rdtypes.ANY.DS.DS], typing.List[IPAddress]] = {}
+
+        async def get_delegation(ns_addr: IPAddress, ns_name: DomainName):
+            r = self.lookup_servers.get(ns_addr)
+            try:
+                delegation = await r.delegation(self.name)
+            except DnsException as e:
+                self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(str(e))
+                return
+            if delegation is None:
+                self.ir.error(f'Missing delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
+                return
+            delegations.setdefault(delegation, []).append(ns_addr)
+            try:
+                ds = await r.ds(self.name)
+            except DnsException as e:
+                self.ir.error(f'Failed to get (dnssec) DS to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(str(e))
+                return
+            if not ds is None:
+                ds_set = frozenset(ds)
+                ds_sets.setdefault(ds_set, []).append(ns_addr)
+
+        async with trio.open_nursery() as nursery:
+            for ns_addr, ns_name in parent_addresses.items():
+                nursery.start_soon(get_delegation, ns_addr, ns_name)
+
+        if len(delegations) == 0:
+            self.ir.error(f'No Delegations to {self.name} anywhere')
             return
-        for addr in addresses:
-            if addr in parent_addresses:
-                ir.info(f'IP {addr} duplicate in NS set for {parent_ns_set.name} (known as {parent_addresses[addr]} and {parent_ns})')
-            else:
-                parent_addresses[addr] = parent_ns
 
-    async with trio.open_nursery() as nursery:
-        for ns in parent_ns_set:
-            nursery.start_soon(get_parent_ns_addr, ns.target)
+        main_delegation: typing.Optional[Delegation]
+        if len(delegations) != 1:
+            self.ir.warn(f'Different delegations to {self.name}')
+            main_delegation = None
+        else:
+            main_delegation = list(delegations.keys())[0]
 
-    delegations: typing.Dict[Delegation, typing.List[IPAddress]] = {}
-    ds_sets: typing.Dict[typing.FrozenSet[dns.rdtypes.ANY.DS.DS], typing.List[IPAddress]] = {}
-
-    async def get_delegation(ns_addr: IPAddress, ns_name: DomainName):
-        r = lookup_servers.get(ns_addr)
-        try:
-            delegation = await r.delegation(name)
-        except DnsException as e:
-            ir.error(f'Failed to get delegation (NS) to {name} from {ns_addr} ({ns_name})')
-            ir.error(str(e))
-            return
-        if delegation is None:
-            ir.error(f'Missing delegation (NS) to {name} from {ns_addr} ({ns_name})')
-            return
-        delegations.setdefault(delegation, []).append(ns_addr)
-        try:
-            ds = await r.ds(name)
-        except DnsException as e:
-            ir.error(f'Failed to get (dnssec) DS to {name} from {ns_addr} ({ns_name})')
-            ir.error(str(e))
-            return
-        if not ds is None:
-            ds_set = frozenset(ds)
-            ds_sets.setdefault(ds_set, []).append(ns_addr)
-
-    async with trio.open_nursery() as nursery:
-        for ns_addr, ns_name in parent_addresses.items():
-            nursery.start_soon(get_delegation, ns_addr, ns_name)
-
-    if len(delegations) == 0:
-        ir.error(f'No Delegations to {name} anywhere')
-        return
-
-    main_delegation: typing.Optional[Delegation]
-    if len(delegations) != 1:
-        ir.warn(f'Different delegations to {name}')
-        main_delegation = None
-    else:
-        main_delegation = list(delegations.keys())[0]
-
-    if len(delegations) != 1 or ir._debug:
-        for delegation, sources in delegations.items():
-            ir.log('Delegation from ' + ' '.join(map(str, sources)) + ':')
-            for line in delegation.to_lines():
-                ir.log(line)
-
-    if not ds_sets:
-        ir.log(f'No DS records - insecure delegation')
-    elif len(ds_sets) > 1:
-        ir.warn(f'Different DS record sets to {name}')
-    if len(ds_sets) > 1 or ir._debug:
-        for ds_set, sources in ds_sets.items():
-            ir.log('DS set from ' + ' '.join(map(str, sources)) + ':')
-            for ds in ds_set:
-                ir.log(f'* DS {ds}')
-
-    merged_delegation: typing.Dict[str, typing.Set[IPAddress]] = {}
-    for delegation, sources in delegations.items():
-        for ns, addrs in delegation.nameservers_tuple:
-            merged_delegation.setdefault(ns, set()).update(addrs)
-
-    async def get_unglued_ns_addr(ns: str) -> None:
-        ns_name = dns.name.from_text(ns)
-        if ns_name.is_subdomain(name):
-            ir.error(f'Missing glue (addresses) for {ns} - must be part of delegation as it is within {name}')
-            return
-        addrs = await resolver.addresses(ns_name)
-        if not addrs:
-            ir.error(f'NS {ns} has no addresses')
-            return
-        merged_delegation[ns] = set(addrs)
-
-    async with trio.open_nursery() as nursery:
-        for ns, addrs in list(merged_delegation.items()):
-            if not addrs:
-                nursery.start_soon(get_unglued_ns_addr, ns)
-
-    if ir._debug:
-        ir.debug('Using merged delegation:')
-        for ns, addrs in merged_delegation.items():
-            ir.log(f'* NS {ns}: ' + ' '.join(map(str, addrs)))
-
-    logged_expected_delegation = False
-    soas: typing.Dict[dns.rdtypes.ANY.SOA.SOA, typing.Set[IPAddress]] = {}
-    main_soa: typing.Optional[dns.rdtypes.ANY.SOA.SOA] = None
-
-    async def check_auth(ns_addr: IPAddress, ns_name: str) -> None:
-        nonlocal logged_expected_delegation
-        l = lookup_servers.get(ns_addr)
-        try:
-            soa = (await l.soa(name))[0]
-            if main_soa:
-                if main_soa != soa:
-                    ir.error(f'Hidden master SOA mismatch for {name}')
-                    ir.log(f'Main authoritative SOA: {main_soa}')
-                    ir.log(f'Hidden master SOA     : {soa}')
-            else:
-                soas.setdefault(soa, set()).add(ns_addr)
-        except DnsException as e:
-            ir.error(f'Failed to get SOA for {name} from {ns_addr} ({ns_name})')
-            ir.error(str(e))
-            return
-        try:
-            delegation = await l.delegation(name)
-        except DnsException as e:
-            ir.error(f'Failed to get delegation (NS) to {name} from authoritative {ns_addr} ({ns_name})')
-            ir.error(str(e))
-            return
-        if main_delegation:
-            if main_delegation != delegation:
-                ir.warn(f'Delegation mismatch with authoritative {ns_addr} ({ns_name})')
-                if not logged_expected_delegation:
-                    logged_expected_delegation = True
-                    ir.log('Expected delegation:')
-                    for line in main_delegation.to_lines():
-                        ir.log(line)
-                ir.log(f'Authoritive {ns_addr} ({ns_name}) returned:')
+        if len(delegations) != 1 or self.ir._debug:
+            for delegation, sources in delegations.items():
+                self.ir.log('Delegation from ' + ' '.join(map(str, sources)) + ':')
                 for line in delegation.to_lines():
-                    ir.log(line)
-            else:
-                ir.debug(f'Delegation matched data from authoritive {ns_addr} ({ns_name})')
+                    self.ir.log(line)
 
-    def is_dnskey_in_dssets(key: dns.rdtypes.ANY.DNSKEY.DNSKEY):
-        key_id = dns.dnssec.key_id(key)
-        for ds_set in ds_sets:
-            for ds in ds_set:
-                if ds.key_tag != key_id or ds.algorithm != key.algorithm:
+        if not ds_sets:
+            self.ir.log(f'No DS records - insecure delegation')
+        elif len(ds_sets) > 1:
+            self.ir.warn(f'Different DS record sets to {self.name}')
+        if len(ds_sets) > 1 or self.ir._debug:
+            for ds_set, sources in ds_sets.items():
+                self.ir.log('DS set from ' + ' '.join(map(str, sources)) + ':')
+                for ds in ds_set:
+                    self.ir.log(f'* DS {ds}')
+
+        merged_delegation: typing.Dict[str, typing.Set[IPAddress]] = {}
+        for delegation, sources in delegations.items():
+            for ns, addrs in delegation.nameservers_tuple:
+                merged_delegation.setdefault(ns, set()).update(addrs)
+
+        async def get_unglued_ns_addr(ns: str) -> None:
+            ns_name = dns.name.from_text(ns)
+            if ns_name.is_subdomain(self.name):
+                self.ir.error(f'Missing glue (addresses) for {ns} - must be part of delegation as it is within {self.name}')
+                return
+            addrs = await self.resolver.addresses(ns_name)
+            if not addrs:
+                self.ir.error(f'NS {ns} has no addresses')
+                return
+            merged_delegation[ns] = set(addrs)
+
+        async with trio.open_nursery() as nursery:
+            for ns, addrs in list(merged_delegation.items()):
+                if not addrs:
+                    nursery.start_soon(get_unglued_ns_addr, ns)
+
+        if self.ir._debug:
+            self.ir.debug('Using merged delegation:')
+            for ns, addrs in merged_delegation.items():
+                self.ir.log(f'* NS {ns}: ' + ' '.join(map(str, addrs)))
+
+        logged_expected_delegation = False
+        soas: typing.Dict[dns.rdtypes.ANY.SOA.SOA, typing.Set[IPAddress]] = {}
+        main_soa: typing.Optional[dns.rdtypes.ANY.SOA.SOA] = None
+
+        async def check_auth(ns_addr: IPAddress, ns_name: str) -> None:
+            nonlocal logged_expected_delegation
+            l = self.lookup_servers.get(ns_addr)
+            try:
+                soa = (await l.soa(self.name))[0]
+                if main_soa:
+                    if main_soa != soa:
+                        self.ir.error(f'Hidden master SOA mismatch for {self.name}')
+                        self.ir.log(f'Main authoritative SOA: {main_soa}')
+                        self.ir.log(f'Hidden master SOA     : {soa}')
+                else:
+                    soas.setdefault(soa, set()).add(ns_addr)
+            except DnsException as e:
+                self.ir.error(f'Failed to get SOA for {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(str(e))
+                return
+            try:
+                delegation = await l.delegation(self.name)
+            except DnsException as e:
+                self.ir.error(f'Failed to get delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
+                self.ir.error(str(e))
+                return
+            if main_delegation:
+                if main_delegation != delegation:
+                    self.ir.warn(f'Delegation mismatch with authoritative {ns_addr} ({ns_name})')
+                    if not logged_expected_delegation:
+                        logged_expected_delegation = True
+                        self.ir.log('Expected delegation:')
+                        for line in main_delegation.to_lines():
+                            self.ir.log(line)
+                    self.ir.log(f'Authoritive {ns_addr} ({ns_name}) returned:')
+                    for line in delegation.to_lines():
+                        self.ir.log(line)
+                else:
+                    self.ir.debug(f'Delegation matched data from authoritive {ns_addr} ({ns_name})')
+
+        def is_dnskey_in_dssets(key: dns.rdtypes.ANY.DNSKEY.DNSKEY):
+            key_id = dns.dnssec.key_id(key)
+            for ds_set in ds_sets:
+                for ds in ds_set:
+                    if ds.key_tag != key_id or ds.algorithm != key.algorithm:
+                        continue
+                    cmp_ds = dns.dnssec.make_ds(self.name, key, ds.digest_type)
+                    if cmp_ds.digest == ds.digest:
+                        return True
+
+        def filter_dnskeys(dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> typing.Dict[dns.name.Name, dns.rdataset.Rdataset]:
+            result: typing.List[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
+            for key in dnskey_set:
+                if 0 == key.flags & dns.rdtypes.ANY.DNSKEY.ZONE or 3 != key.protocol:
                     continue
-                cmp_ds = dns.dnssec.make_ds(name, key, ds.digest_type)
-                if cmp_ds.digest == ds.digest:
-                    return True
+                if is_dnskey_in_dssets(key):
+                    result.append(key)
+            return { self.name: dns.rdataset.from_rdata_list(dnskey_set.ttl, result) }
 
-    def filter_dnskeys(dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> typing.Dict[dns.name.Name, dns.rdataset.Rdataset]:
-        result: typing.List[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
-        for key in dnskey_set:
-            if 0 == key.flags & dns.rdtypes.ANY.DNSKEY.ZONE or 3 != key.protocol:
-                continue
-            if is_dnskey_in_dssets(key):
-                result.append(key)
-        return { name: dns.rdataset.from_rdata_list(dnskey_set.ttl, result) }
+        async def check_dnskey(ns_addr: IPAddress, ns_name: str) -> None:
+            l = self.lookup_servers.get(ns_addr)
+            try:
+                dnskey_set, response, _ = await l.query(dns.message.make_query(self.name, dns.rdatatype.DNSKEY, want_dnssec=True))
+            except DnsException as e:
+                self.ir.error(f'Failed to get DNSKEY for {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(str(e))
+                return
+            if not dnskey_set:
+                self.ir.error(f'Missing DNSKEY for {self.name} from {ns_addr} ({ns_name}) - but delegation is secured by DS')
+                return
+            acceptable_dnskeys = filter_dnskeys(dnskey_set)
+            rrsig_set = response.get_rrset(dns.message.ANSWER, self.name, dnskey_set.rdclass, dns.rdatatype.RRSIG, dns.rdatatype.DNSKEY)
+            if not rrsig_set:
+                self.ir.error(f'DNSKEY for {self.name} not signed from {ns_addr} ({ns_name})')
+                return
+            try:
+                dns.dnssec.validate(dnskey_set, rrsig_set, acceptable_dnskeys)
+                self.ir.debug(f'DNSKEY good for {self.name} from {ns_addr} ({ns_name})')
+            except dns.dnssec.ValidationFailure:
+                self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_addr} ({ns_name})')
+                return
 
-    async def check_dnskey(ns_addr: IPAddress, ns_name: str) -> None:
-        l = lookup_servers.get(ns_addr)
-        try:
-            dnskey_set, response, _ = await l.query(dns.message.make_query(name, dns.rdatatype.DNSKEY, want_dnssec=True))
-        except DnsException as e:
-            ir.error(f'Failed to get DNSKEY for {name} from {ns_addr} ({ns_name})')
-            ir.error(str(e))
-            return
-        if not dnskey_set:
-            ir.error(f'Missing DNSKEY for {name} from {ns_addr} ({ns_name}) - but delegation is secured by DS')
-            return
-        acceptable_dnskeys = filter_dnskeys(dnskey_set)
-        rrsig_set = response.get_rrset(dns.message.ANSWER, name, dnskey_set.rdclass, dns.rdatatype.RRSIG, dns.rdatatype.DNSKEY)
-        if not rrsig_set:
-            ir.error(f'DNSKEY for {name} not signed from {ns_addr} ({ns_name})')
-            return
-        try:
-            dns.dnssec.validate(dnskey_set, rrsig_set, acceptable_dnskeys)
-            ir.debug(f'DNSKEY good for {name} from {ns_addr} ({ns_name})')
-        except dns.dnssec.ValidationFailure:
-            ir.error(f'Invalid signatures on DNSKEY for {name} from {ns_addr} ({ns_name})')
-            return
-
-    async with trio.open_nursery() as nursery:
-        for ns_name, addrs in merged_delegation.items():
-            for ns_addr in addrs:
-                nursery.start_soon(check_auth, ns_addr, ns_name)
-                if ds_sets:
-                    nursery.start_soon(check_dnskey, ns_addr, ns_name)
-
-    if not soas:
-        ir.error(f'Found no SOA for {name}')
-    elif len(soas) == 1:
-        main_soa = list(soas.keys())[0]
-        ir.log(f'Found single SOA: {name} SOA {main_soa}')
-    else:
-        ir.warn(f'Found multiple SOAs for {name}')
-        for soa in soas:
-            ir.log(f'* {name} SOA {soa}')
-
-    expect_auths = [
-        dns.name.from_text(auth.strip().lower())
-        for opt in (opts.expect_auth or [])
-        for auth in opt.split(',')
-    ]
-    for auth in expect_auths:
-        if not str(auth) in merged_delegation:
-            ir.error(f'Missing expected auth {auth} in NS set for {name}')
-        else:
-            ir.debug(f'Found expected auth {auth} in NS set for {name}')
-
-    if main_soa and not str(main_soa.mname) in merged_delegation:
-        hm = main_soa.mname
-        ir.log(f'Found hidden master {hm}')
-        if not opts.skip_hidden_master:
-            hm_addrs = await resolver.addresses(hm)
-            async with trio.open_nursery() as nursery:
-                for ns_addr in hm_addrs:
-                    nursery.start_soon(check_auth, ns_addr, hm)
+        async with trio.open_nursery() as nursery:
+            for ns_name, addrs in merged_delegation.items():
+                for ns_addr in addrs:
+                    nursery.start_soon(check_auth, ns_addr, ns_name)
                     if ds_sets:
-                        nursery.start_soon(check_dnskey, ns_addr, hm)
+                        nursery.start_soon(check_dnskey, ns_addr, ns_name)
+
+        if not soas:
+            self.ir.error(f'Found no SOA for {self.name}')
+        elif len(soas) == 1:
+            main_soa = list(soas.keys())[0]
+            self.ir.log(f'Found single SOA: {self.name} SOA {main_soa}')
         else:
-            ir.log(f'Not checking hidden master as requested')
+            self.ir.warn(f'Found multiple SOAs for {self.name}')
+            for soa in soas:
+                self.ir.log(f'* {self.name} SOA {soa}')
 
-    if main_delegation:
-        ir.log('+ Checked delegation with authoritative')
-    if ds_sets:
-        ir.log('+ Checked DNSSEC delegation with authoritative')
-    if main_soa:
-        ir.log('+ Checked SOA records')
+        expect_auths = [
+            dns.name.from_text(auth.strip().lower())
+            for opt in (self.opts.expect_auth or [])
+            for auth in opt.split(',')
+        ]
+        for auth in expect_auths:
+            if not str(auth) in merged_delegation:
+                self.ir.error(f'Missing expected auth {auth} in NS set for {self.name}')
+            else:
+                self.ir.debug(f'Found expected auth {auth} in NS set for {self.name}')
+
+        if main_soa and not str(main_soa.mname) in merged_delegation:
+            hm = main_soa.mname
+            self.ir.log(f'Found hidden master {hm}')
+            if not self.opts.skip_hidden_master:
+                hm_addrs = await self.resolver.addresses(hm)
+                async with trio.open_nursery() as nursery:
+                    for ns_addr in hm_addrs:
+                        nursery.start_soon(check_auth, ns_addr, hm)
+                        if ds_sets:
+                            nursery.start_soon(check_dnskey, ns_addr, hm)
+            else:
+                self.ir.log(f'Not checking hidden master as requested')
+
+        if main_delegation:
+            self.ir.log('+ Checked delegation with authoritative')
+        if ds_sets:
+            self.ir.log('+ Checked DNSSEC delegation with authoritative')
+        if main_soa:
+            self.ir.log('+ Checked SOA records')
 
 
-if __name__ == '__main__':
+def main():
     p = argparse.ArgumentParser(description="Check DNS zone (delegation, SOA, DNSSEC) on all authoritatives and hidden primary")
     p.add_argument('zone', help='Name of DNS zone to check')
     p.add_argument('--skip-hidden-master', action='store_true', help="Don't verify hidden master data (might be blocked by a firewall)")
@@ -540,5 +545,9 @@ if __name__ == '__main__':
     p.add_argument('--expect-auth', action='append', help="Make sure listed servers are part of the NS set of the zone")
     opts = p.parse_args()
     ir = IcingaResult(debug=opts.debug)
-    trio.run(main, ir, opts)
+    trio.run(CheckNameContext(ir, opts).check)
     ir.finish()
+
+
+if __name__ == '__main__':
+    main()
