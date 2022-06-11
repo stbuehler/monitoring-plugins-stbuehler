@@ -584,16 +584,88 @@ class CheckNameContext:
             else:
                 self.ir.debug(f"Hidden primary SOA from {' '.join(sources)} matches main SOA")
 
-    async def check(self):
-        await self.retrieve_parent_addresses()
-        await self.retreive_delegations()
-        await self.check_delegations()
+    _DIRECT_PRIVATE_ADDRESS_ZONES = {
+        '10.in-addr.arpa',  # 10.0.0.0/8
+        '168.192.in-addr.arpa',  # 192.168.0.0/16
+        # fc00::/7 not included for now.
+        # ULA: only fd00::/8 as entry; entries below can be specified through --private-entry ...
+        '0.0.d.f.ip6.arpa',
+    }
 
-        if len(self.parent_delegations) == 0:
-            # error was already logged, but we can't continue here
+    def is_private_zone(self) -> bool:
+        if self.opts.private:
+            return True
+        private_entries = {
+            dns.name.from_text(part.strip())
+            for entry in (self.opts.private_entry or [])
+            for part in entry.split(',')
+        }
+        if self.name in private_entries:
+            return True
+        if self.opts.private_reverse:
+            if self.name == dns.name.root:
+                return False
+            # simply cases in self._DIRECT_PRIVATE_ADDRESS_ZONES, but shouldn't be too many
+            for z in self._DIRECT_PRIVATE_ADDRESS_ZONES:
+                if self.name == dns.name.from_text(z):
+                    return True
+            parent = self.name.parent()
+            if parent == dns.name.from_text('172.in-addr.arpa'):
+                # 172.16.0.0/12: 172.16 - 172.31
+                if self.name.labels[0] in (f'{i}'.encode('ascii') for i in range(16, 32)):
+                    return True
+            elif parent == dns.name.from_text('100.in-addr.arpa'):
+                # 100.64.0.0/10, 100.64 - 100.127
+                if self.name.labels[0] in (f'{i}'.encode('ascii') for i in range(64, 128)):
+                    return True
+        return False
+
+    async def get_private_zone_auths(self) -> typing.Dict[str, typing.Set[IPAddress]]:
+        result: typing.Dict[str, typing.Set[IPAddress]] = {}
+
+        async def get_ns_addr(ns: DomainName) -> None:
+            try:
+                result[str(ns)] = await self.resolver.addresses(ns)
+            except DnsException as e:
+                self.ir.error(f'Failed to lookup addresses for NS {ns} of zone {self.name}')
+                self.ir.error(str(e))
+                return
+
+        try:
+            ns_set = await self.resolver.ns(self.name)
+        except DnsException as e:
+            self.ir.error(f'Failed to lookup NS for zone {self.name}')
+            self.ir.error(str(e))
+            return result
+
+        async with trio.open_nursery() as nursery:
+            for ns in ns_set:
+                nursery.start_soon(get_ns_addr, ns.target)
+
+        if self.ir._debug:
+            self.ir.debug('Using delegation received from resolver for private zone {self.name}:')
+            for ns, addrs in result.items():
+                self.ir.log(f'* NS {ns}: ' + ' '.join(map(str, addrs)))
+
+        return result
+
+    async def check(self):
+        private_zone = self.is_private_zone()
+        if not private_zone:
+            await self.retrieve_parent_addresses()
+            await self.retreive_delegations()
+            await self.check_delegations()
+
+            self.auths_by_name = await self.build_merged_delegation()
+        else:
+            self.ir.log("Not checking delegation, was marked as private zone entry")
+            self.auths_by_name = await self.get_private_zone_auths()
+
+        if len(self.auths_by_name) == 0:
+            # there should have been an error message about this already
+            self.ir.error("Can't continue without authoritative nameservers to query")
             return
 
-        self.auths_by_name = await self.build_merged_delegation()
         self.auths = self.transpose_delegation_auths(self.auths_by_name)
 
         await self.retreive_auth_responses()
@@ -650,6 +722,15 @@ class CheckNameContext:
                         self.ir.log(line)
                 else:
                     self.ir.debug(f'Delegation matched data from authoritive {self.sources_names(sources, self.auths)}')
+        elif private_zone:
+            # Can't compare with delegation from parent(s), so check between auths
+            if len(self.auth_delegations) > 1:
+                self.ir.error("Multiple delegations from authoritatives")
+            if len(self.auth_delegations) > 1 or self.ir._debug:
+                for delegation, sources in self.auth_delegations.items():
+                    self.ir.log(f'Delegation data from authoritatives {self.sources_names(sources, self.auths)}:')
+                    for line in delegation.to_lines():
+                        self.ir.log(line)
 
         expect_auths = [
             dns.name.from_text(auth.strip().lower())
@@ -677,6 +758,9 @@ def main():
     p.add_argument('--auth-tcp', action='store_true', help="Use TCP for DNS queries to authoritative servers")
     p.add_argument('--debug', action='store_true', help="Show debug output")
     p.add_argument('--expect-auth', action='append', help="Make sure listed servers are part of the NS set of the zone")
+    p.add_argument('--private', action='store_true', help="Don't check the delegation (i.e. only SOA)")
+    p.add_argument('--private-reverse', action='store_true', help="Don't check the delegation (i.e. only SOA), if the zone is an entry to the reverse zone for private IP addresses")
+    p.add_argument('--private-entry', action='append', help="Mark given zone name(s) as entry to private zones where delegation isn't checked")
     opts = p.parse_args()
     ir = IcingaResult(debug=opts.debug)
     trio.run(CheckNameContext(ir, opts).check)
