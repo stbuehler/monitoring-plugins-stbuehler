@@ -121,6 +121,7 @@ class DnsTimeoutError(dns.exception.DNSException):
 
 
 class DnsConnectionClosedError(dns.exception.DNSException):
+    # created from EOFError
     def __init__(self, query: dns.message.Message, server: IPAddress) -> None:
         self.query = query
         self.server = server
@@ -128,6 +129,17 @@ class DnsConnectionClosedError(dns.exception.DNSException):
     def __str__(self) -> str:
         query = self.query.question[0]
         return f"Query @{self.server} {query} failed: server closed connection too early"
+
+
+class DnsOsError(dns.exception.DNSException):
+    def __init__(self, query: dns.message.Message, server: IPAddress, error: OSError) -> None:
+        self.query = query
+        self.server = server
+        self.error = error
+
+    def __str__(self) -> str:
+        query = self.query.question[0]
+        return f"Query @{self.server} {query} failed: {self.error}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -194,6 +206,9 @@ class DnsLookup:
         except EOFError:
             # with TCP query: server closed connection without answering / too early
             raise DnsConnectionClosedError(query=query, server=self._server)
+        except OSError as error:
+            # sadly need a quite generic catch here to handle "no route to host" (and probably similar others)
+            raise DnsOsError(query=query, server=self._server, error=error)
         except trio.TooSlowError:
             raise DnsTimeoutError(query=query, server=self._server)
         rcode = response.rcode()
@@ -386,7 +401,8 @@ class CheckNameContext:
             r = self.lookup_servers.get(ns_addr)
             try:
                 delegation = await r.delegation(self.name)
-            except (DnsTimeoutError, DnsConnectionClosedError):
+            except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
+                # assume other "OS" error indicate some kind of unreachability
                 parent_auths_down.add(ns_name)
                 self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
                 self.ir.log(str(e))
