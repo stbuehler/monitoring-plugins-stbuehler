@@ -6,6 +6,7 @@ import dataclasses
 import dns
 import dns.asyncquery
 import dns.dnssec
+import dns.exception
 import dns.message
 import dns.name
 import dns.rcode
@@ -98,10 +99,7 @@ class IcingaResult:
         sys.exit(self._code)
 
 
-class DnsException(Exception):
-    pass
-
-class DnsMessageError(DnsException):
+class DnsMessageError(dns.exception.DNSException):
     def __init__(self, query: dns.message.Message, response: dns.message.Message, server: IPAddress) -> None:
         self.query = query
         self.response = response
@@ -112,7 +110,7 @@ class DnsMessageError(DnsException):
         return f"Query @{self.server} {query} failed with {dns.rcode.to_text(self.response.rcode())}"
 
 
-class DnsTimeoutError(DnsException):
+class DnsTimeoutError(dns.exception.DNSException):
     def __init__(self, query: dns.message.Message, server: IPAddress) -> None:
         self.query = query
         self.server = server
@@ -120,6 +118,16 @@ class DnsTimeoutError(DnsException):
     def __str__(self) -> str:
         query = self.query.question[0]
         return f"Query @{self.server} {query} timed out"
+
+
+class DnsConnectionClosedError(dns.exception.DNSException):
+    def __init__(self, query: dns.message.Message, server: IPAddress) -> None:
+        self.query = query
+        self.server = server
+
+    def __str__(self) -> str:
+        query = self.query.question[0]
+        return f"Query @{self.server} {query} failed: server closed connection too early"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -183,6 +191,9 @@ class DnsLookup:
                     response = await dns.asyncquery.tcp(query, self._server_str)
                 else:
                     (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
+        except EOFError:
+            # with TCP query: server closed connection without answering / too early
+            raise DnsConnectionClosedError(query=query, server=self._server)
         except trio.TooSlowError:
             raise DnsTimeoutError(query=query, server=self._server)
         rcode = response.rcode()
@@ -349,7 +360,7 @@ class CheckNameContext:
             try:
                 addresses = await self.resolver.addresses(parent_ns)
                 self.ir.debug(f'Addresses of NS {parent_ns}: ' + ' '.join(str(addr) for addr in addresses))
-            except DnsException as e:
+            except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_set.name} of {self.name}')
                 self.ir.error(str(e))
                 return
@@ -368,7 +379,7 @@ class CheckNameContext:
             r = self.lookup_servers.get(ns_addr)
             try:
                 delegation = await r.delegation(self.name)
-            except DnsException as e:
+            except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
                 self.ir.error(str(e))
                 return
@@ -378,7 +389,7 @@ class CheckNameContext:
             self.parent_delegations.setdefault(delegation, []).append(ns_addr)
             try:
                 ds = await r.ds(self.name)
-            except DnsException as e:
+            except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get (dnssec) DS to {self.name} from {ns_addr} ({ns_name})')
                 self.ir.error(str(e))
                 return
@@ -505,7 +516,7 @@ class CheckNameContext:
         l = self.lookup_servers.get(ns_addr)
         try:
             dnskey_set, response, _ = await l.query(dns.message.make_query(self.name, dns.rdatatype.DNSKEY, want_dnssec=True))
-        except DnsException as e:
+        except dns.exception.DNSException as e:
             self.ir.error(f'Failed to get DNSKEY for {self.name} from {ns_addr} ({ns_name})')
             self.ir.error(str(e))
             return
@@ -529,7 +540,7 @@ class CheckNameContext:
         l = self.lookup_servers.get(ns_addr)
         try:
             delegation = await l.delegation(self.name)
-        except DnsException as e:
+        except dns.exception.DNSException as e:
             self.ir.error(f'Failed to get delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
             self.ir.error(str(e))
             return
@@ -543,7 +554,7 @@ class CheckNameContext:
             l = self.lookup_servers.get(ns_addr)
             try:
                 soa = await l.soa(self.name)
-            except DnsException as e:
+            except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get SOA for {self.name} from {ns_addr} ({ns_name})')
                 self.ir.error(str(e))
                 return
@@ -567,7 +578,7 @@ class CheckNameContext:
             l = self.lookup_servers.get(ns_addr)
             try:
                 soa = await l.soa(self.name)
-            except DnsException as e:
+            except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get SOA for {self.name} from {ns_addr} ({hm})')
                 self.ir.error(str(e))
                 return
@@ -640,14 +651,14 @@ class CheckNameContext:
         async def get_ns_addr(ns: dns.name.Name) -> None:
             try:
                 result[ns] = set(await self.resolver.addresses(ns))
-            except DnsException as e:
+            except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to lookup addresses for NS {ns} of zone {self.name}')
                 self.ir.error(str(e))
                 return
 
         try:
             ns_set = await self.resolver.ns(self.name)
-        except DnsException as e:
+        except dns.exception.DNSException as e:
             self.ir.error(f'Failed to lookup NS for zone {self.name}')
             self.ir.error(str(e))
             return result
