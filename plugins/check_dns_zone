@@ -687,6 +687,7 @@ class CheckNameContext:
 
         await self.retreive_auth_responses()
 
+        log_soas = False
         if not self.auth_soas:
             self.ir.error(f'Found no SOA for {self.name}')
         elif len(self.auth_soas) == 1:
@@ -710,8 +711,13 @@ class CheckNameContext:
                     self.ir.log(f'Found multiple SOAs for {self.name}, but they only differ in the mname field')
             if multiple_soas:
                 self.ir.warn(f'Found multiple SOAs for {self.name}')
-            for soa in self.auth_soas:
-                self.ir.log(f'* {self.name} SOA {soa}')
+            log_soas = True
+        if log_soas or self.ir._debug:
+            if not log_soas:
+                self.ir.debug('SOAs from authoritatives:')
+            for soa, sources in self.auth_soas.items():
+                self.ir.log(f'From {self.sources_names(sources, self.auths)}:')
+                self.ir.log(f'  {self.name} SOA {soa}')
 
         if self.main_soa:
             if not self.main_soa.mname in self.auths_by_name:
