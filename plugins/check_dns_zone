@@ -315,6 +315,10 @@ class CheckNameContext:
 
         #### Values we fill during lookup ####
 
+        # List of all NS names for parent zone
+        # Filled in `retrieve_parent_addresses`
+        self.parent_ns_set: typing.Set[dns.name.Name] = set()
+
         # IP addresses of the authoritative nameservers for the parent zone,
         # and for each address the name it was resolved from.
         # If multiple names resolve to the same address, only a single (random) name is selected.
@@ -372,13 +376,20 @@ class CheckNameContext:
 
         async with trio.open_nursery() as nursery:
             for ns in parent_ns_set:
+                self.parent_ns_set.add(ns)
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
     async def retreive_delegations(self) -> None:
+        parent_auths_down: typing.Set[dns.name.Name] = set()
+
         async def get_delegation(ns_addr: IPAddress, ns_name: dns.name.Name):
             r = self.lookup_servers.get(ns_addr)
             try:
                 delegation = await r.delegation(self.name)
+            except (DnsTimeoutError, DnsConnectionClosedError):
+                parent_auths_down.add(ns_name)
+                self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.log(str(e))
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
                 self.ir.error(str(e))
@@ -400,6 +411,9 @@ class CheckNameContext:
         async with trio.open_nursery() as nursery:
             for ns_addr, ns_name in self.parent_addresses.items():
                 nursery.start_soon(get_delegation, ns_addr, ns_name)
+
+        if len(parent_auths_down) > 1 or (len(self.parent_ns_set) <= 2 and parent_auths_down):
+            self.ir.error(f"Too many parent authoritatives unreachable: {' '.join(map(str, parent_auths_down))}")
 
     async def check_delegations(self) -> None:
         if len(self.parent_delegations) == 0:
