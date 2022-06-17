@@ -242,8 +242,9 @@ class DnsLookup:
         if isinstance(name, str):
             name = dns.name.from_text(name)
         assert name != dns.name.root, f"Can't get parent of root: {name!r}"
+        parent = name
         while True:
-            parent = name.parent()
+            parent = parent.parent()
             ns = await self.ns(parent)
             if ns:
                 return ns
