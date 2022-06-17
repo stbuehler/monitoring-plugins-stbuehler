@@ -391,7 +391,7 @@ class CheckNameContext:
 
         async with trio.open_nursery() as nursery:
             for ns in parent_ns_set:
-                self.parent_ns_set.add(ns)
+                self.parent_ns_set.add(ns.target)
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
     async def retreive_delegations(self) -> None:
@@ -405,7 +405,6 @@ class CheckNameContext:
                 # assume other "OS" error indicate some kind of unreachability
                 parent_auths_down.add(ns_name)
                 self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
-                self.ir.log(str(e))
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
                 self.ir.error(str(e))
@@ -623,7 +622,7 @@ class CheckNameContext:
                 if ns_addr in self.auths:
                     self.ir.info(f'IP {ns_addr} of hidden primary {hm} duplicate of NS set for {self.name} (known as {self.auths[ns_addr]})')
                     continue
-                self.auths[ns_addr] = str(hm)
+                self.auths[ns_addr] = hm
                 nursery.start_soon(check_soa, ns_addr)
                 nursery.start_soon(self.retrieve_auth_delegation, ns_addr, hm)
                 if self.parent_ds_sets:
