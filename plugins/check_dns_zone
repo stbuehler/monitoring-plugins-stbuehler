@@ -426,10 +426,14 @@ class CheckNameContext:
             if delegation is None:
                 self.ir.error(f'Missing delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
                 return
-            reachable_auths.add(ns_name)
             self.parent_delegations.setdefault(delegation, []).append(ns_addr)
             try:
                 ds = await r.ds(self.name)
+            except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
+                # assume other "OS" error indicate some kind of unreachability
+                auth_ips_down.add(ns_addr)
+                self.ir.log(f'Failed to get (dnssec) (DS) to {self.name} from {ns_addr} ({ns_name})')
+                return
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get (dnssec) DS to {self.name} from {ns_addr} ({ns_name})')
                 self.ir.error(str(e))
@@ -437,6 +441,7 @@ class CheckNameContext:
             if not ds is None:
                 ds_set = frozenset(ds)
                 self.parent_ds_sets.setdefault(ds_set, []).append(ns_addr)
+            reachable_auths.add(ns_name)
 
         async with trio.open_nursery() as nursery:
             for ns_addr, ns_name in self.parent_addresses.items():
