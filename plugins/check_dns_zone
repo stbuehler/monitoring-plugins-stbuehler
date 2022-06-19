@@ -862,19 +862,26 @@ class CheckNameContext:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Check DNS zone (delegation, SOA, DNSSEC) on all authoritatives and hidden primary")
-    p.add_argument('zone', help='Name of DNS zone to check')
-    p.add_argument('--skip-hidden-primary', '--skip-hidden-master', action='store_true', help="Don't verify hidden primary data (might be blocked by a firewall)")
-    p.add_argument('--auth-tcp', action='store_true', help="Use TCP for DNS queries to authoritative servers")
-    p.add_argument('--debug', action='store_true', help="Show debug output")
-    p.add_argument('--expect-auth', action='append', help="Make sure listed servers are part of the NS set of the zone")
-    p.add_argument('--private', action='store_true', help="Don't check the delegation (i.e. only SOA)")
-    p.add_argument('--private-reverse', action='store_true', help="Don't check the delegation (i.e. only SOA), if the zone is an entry to the reverse zone for private IP addresses")
-    p.add_argument('--private-entry', action='append', help="Mark given zone name(s) as entry to private zones where delegation isn't checked")
-    p.add_argument('--resolver', action='store', help="Use given address as DNS resolver")
-    opts = p.parse_args()
-    ir = IcingaResult(debug=opts.debug)
-    trio.run(CheckNameContext(ir, opts).check)
+    try:
+        p = argparse.ArgumentParser(description="Check DNS zone (delegation, SOA, DNSSEC) on all authoritatives and hidden primary")
+        p.add_argument('zone', help='Name of DNS zone to check')
+        p.add_argument('--skip-hidden-primary', '--skip-hidden-master', action='store_true', help="Don't verify hidden primary data (might be blocked by a firewall)")
+        p.add_argument('--auth-tcp', action='store_true', help="Use TCP for DNS queries to authoritative servers")
+        p.add_argument('--debug', action='store_true', help="Show debug output")
+        p.add_argument('--expect-auth', action='append', help="Make sure listed servers are part of the NS set of the zone")
+        p.add_argument('--private', action='store_true', help="Don't check the delegation (i.e. only SOA)")
+        p.add_argument('--private-reverse', action='store_true', help="Don't check the delegation (i.e. only SOA), if the zone is an entry to the reverse zone for private IP addresses")
+        p.add_argument('--private-entry', action='append', help="Mark given zone name(s) as entry to private zones where delegation isn't checked")
+        p.add_argument('--resolver', action='store', help="Use given address as DNS resolver")
+        opts = p.parse_args()
+        ir = IcingaResult(debug=opts.debug)
+        trio.run(CheckNameContext(ir, opts).check)
+    except Exception as e:
+        import traceback
+        ir.unknown("Unknown exception")
+        # although traceback returns "lines", they include \n - undo that
+        for line in ''.join(traceback.format_exception(e)).splitlines():
+            ir.log(line)
     ir.finish()
 
 
