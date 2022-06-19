@@ -372,30 +372,43 @@ class CheckNameContext:
         )
 
     async def retrieve_parent_addresses(self) -> None:
-        parent_ns_set = await self.resolver.find_parent_zone(self.name)
-        self.ir.debug(f'NS for parent zone {parent_ns_set.name} of {self.name}: ' + ' '.join(str(ns.target) for ns in parent_ns_set))
+        try:
+            parent_ns_rrset = await self.resolver.find_parent_zone(self.name)
+        except dns.exception.DNSException as e:
+            self.ir.error(f'Failed to find parent zone for {self.name}')
+            self.ir.error(str(e))
+            return
+        self.ir.debug(f'NS for parent zone {parent_ns_rrset.name} of {self.name}: ' + ' '.join(str(ns.target) for ns in parent_ns_rrset))
 
         async def get_parent_ns_addr(parent_ns: dns.name.Name) -> None:
             try:
                 addresses = await self.resolver.addresses(parent_ns)
                 self.ir.debug(f'Addresses of NS {parent_ns}: ' + ' '.join(str(addr) for addr in addresses))
             except dns.exception.DNSException as e:
-                self.ir.error(f'Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_set.name} of {self.name}')
+                self.ir.error(f'Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_rrset.name} of {self.name}')
                 self.ir.error(str(e))
                 return
+            owns_an_address = False
             for addr in addresses:
                 if addr in self.parent_addresses:
-                    self.ir.info(f'IP {addr} duplicate in NS set for {parent_ns_set.name} (known as {self.parent_addresses[addr]} and {parent_ns})')
+                    self.ir.info(f'IP {addr} duplicate in NS set for {parent_ns_rrset.name} (known as {self.parent_addresses[addr]} and {parent_ns})')
                 else:
+                    owns_an_address = True
                     self.parent_addresses[addr] = parent_ns
+            # don't add to `self.parent_ns_set` if it only contains duplicate IPs
+            if owns_an_address:
+                self.parent_ns_set.add(ns.target)
+            else:
+                self.ir.info(f'NS {parent_ns} for parent zone has no unique IPs, removing it from further consideration')
+
 
         async with trio.open_nursery() as nursery:
-            for ns in parent_ns_set:
-                self.parent_ns_set.add(ns.target)
+            for ns in parent_ns_rrset:
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
     async def retreive_delegations(self) -> None:
-        parent_auths_down: typing.Set[dns.name.Name] = set()
+        reachable_auths: typing.Set[dns.name.Name] = set()
+        auth_ips_down: typing.Set[IPAddress] = set()
 
         async def get_delegation(ns_addr: IPAddress, ns_name: dns.name.Name):
             r = self.lookup_servers.get(ns_addr)
@@ -403,7 +416,7 @@ class CheckNameContext:
                 delegation = await r.delegation(self.name)
             except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
                 # assume other "OS" error indicate some kind of unreachability
-                parent_auths_down.add(ns_name)
+                auth_ips_down.add(ns_addr)
                 self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
@@ -412,6 +425,7 @@ class CheckNameContext:
             if delegation is None:
                 self.ir.error(f'Missing delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
                 return
+            reachable_auths.add(ns_name)
             self.parent_delegations.setdefault(delegation, []).append(ns_addr)
             try:
                 ds = await r.ds(self.name)
@@ -427,8 +441,26 @@ class CheckNameContext:
             for ns_addr, ns_name in self.parent_addresses.items():
                 nursery.start_soon(get_delegation, ns_addr, ns_name)
 
-        if len(parent_auths_down) > 1 or (len(self.parent_ns_set) <= 2 and parent_auths_down):
-            self.ir.error(f"Too many parent authoritatives unreachable: {' '.join(map(str, parent_auths_down))}")
+        parent_auths_down = self.parent_ns_set - reachable_auths
+
+        if len(reachable_auths) == 0:
+            self.ir.error(f"No parent authoritatives reachable")
+        assert self.parent_delegations, "Must have at least one delegation here"
+
+        # TODO: what are proper warning levels?
+        # we have:
+        # * number of unreachable IPs (vs total IPs)
+        # * number of unreachable NS, i.e. unreachable on all their IPs (vs number of NS)
+        #   (although if NS have overlapping IPs this is a "simplified" measurement)
+
+        # IP address heuristic: half the IPs should be reachable
+        if 2 * len(auth_ips_down) > len(self.parent_addresses):
+            self.ir.warn(f"Too many parent authoritative IPs unreachable: {self.sources_names(auth_ips_down, self.parent_addresses)}")
+        # NS heuristic: half of the NS should be reachable
+        elif 2 * len(parent_auths_down) > len(self.parent_ns_set):
+            self.ir.warn(f"Too many parent authoritatives unreachable: {' '.join(map(str, parent_auths_down))}")
+        elif parent_auths_down:
+            self.ir.info(f"Some parent authoritatives are unreachable: {' '.join(map(str, parent_auths_down))}")
 
     async def check_delegations(self) -> None:
         if len(self.parent_delegations) == 0:
@@ -490,7 +522,12 @@ class CheckNameContext:
             if ns.is_subdomain(self.name):
                 # missing glue - logged above.
                 return
-            addrs = await self.resolver.addresses(ns)
+            try:
+                addrs = await self.resolver.addresses(ns)
+            except dns.exception.DNSException as e:
+                self.ir.error(f'Failed to lookup (glue) addresses for NS {ns} for {self.name}')
+                self.ir.error(str(e))
+                return
             if not addrs:
                 self.ir.error(f'NS {ns} has no addresses')
                 return
@@ -565,7 +602,6 @@ class CheckNameContext:
             return
 
     async def retrieve_auth_delegation(self, ns_addr: IPAddress, ns_name: dns.name.Name) -> None:
-        # TODO: allow a few parent authoritatives to be unreachable?
         l = self.lookup_servers.get(ns_addr)
         try:
             delegation = await l.delegation(self.name)
@@ -579,7 +615,7 @@ class CheckNameContext:
             self.ir.error(f'Got no delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
 
     async def retreive_auth_responses(self) -> None:
-        async def get_soa(l: DnsLookup, ns_addr: IPAddress, ns_name: dns.name.Name) -> None:
+        async def get_soa(ns_addr: IPAddress, ns_name: dns.name.Name) -> None:
             l = self.lookup_servers.get(ns_addr)
             try:
                 soa = await l.soa(self.name)
@@ -594,8 +630,7 @@ class CheckNameContext:
 
         async with trio.open_nursery() as nursery:
             for ns_addr, ns_name in self.auths.items():
-                l = self.lookup_servers.get(ns_addr)
-                nursery.start_soon(get_soa, l, ns_addr, ns_name)
+                nursery.start_soon(get_soa, ns_addr, ns_name)
                 nursery.start_soon(self.retrieve_auth_delegation, ns_addr, ns_name)
                 if self.parent_ds_sets:
                     nursery.start_soon(self.check_dnskey, ns_addr, ns_name)
@@ -616,7 +651,12 @@ class CheckNameContext:
             else:
                 self.ir.error(f'Got no SOA for {self.name} from {ns_addr} ({hm})')
 
-        hm_addrs = await self.resolver.addresses(hm)
+        try:
+            hm_addrs = await self.resolver.addresses(hm)
+        except dns.exception.DNSException as e:
+            self.ir.error(f'Failed to lookup addresses for hidden primary {hm}')
+            self.ir.error(str(e))
+            return
         async with trio.open_nursery() as nursery:
             for ns_addr in hm_addrs:
                 if ns_addr in self.auths:
