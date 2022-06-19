@@ -121,14 +121,15 @@ class DnsTimeoutError(dns.exception.DNSException):
 
 
 class DnsConnectionClosedError(dns.exception.DNSException):
-    # created from EOFError
-    def __init__(self, query: dns.message.Message, server: IPAddress) -> None:
+    # created from various "server didn't like us" errors (closed through various means)
+    def __init__(self, query: dns.message.Message, server: IPAddress, error: Exception) -> None:
         self.query = query
         self.server = server
+        self.error = error
 
     def __str__(self) -> str:
         query = self.query.question[0]
-        return f"Query @{self.server} {query} failed: server closed connection too early"
+        return f"Query @{self.server} {query} failed: server closed connection too early {self.error}"
 
 
 class DnsOsError(dns.exception.DNSException):
@@ -203,9 +204,9 @@ class DnsLookup:
                     response = await dns.asyncquery.tcp(query, self._server_str)
                 else:
                     (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
-        except EOFError:
+        except (EOFError, trio.BrokenResourceError) as error:
             # with TCP query: server closed connection without answering / too early
-            raise DnsConnectionClosedError(query=query, server=self._server)
+            raise DnsConnectionClosedError(query=query, server=self._server, error=error)
         except OSError as error:
             # sadly need a quite generic catch here to handle "no route to host" (and probably similar others)
             raise DnsOsError(query=query, server=self._server, error=error)
