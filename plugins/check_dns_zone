@@ -398,10 +398,9 @@ class CheckNameContext:
                     self.parent_addresses[addr] = parent_ns
             # don't add to `self.parent_ns_set` if it only contains duplicate IPs
             if owns_an_address:
-                self.parent_ns_set.add(ns.target)
+                self.parent_ns_set.add(parent_ns)
             else:
                 self.ir.log(f'NS {parent_ns} for parent zone has no unique IPs, removing it from further consideration')
-
 
         async with trio.open_nursery() as nursery:
             for ns in parent_ns_rrset:
