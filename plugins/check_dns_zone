@@ -445,6 +445,7 @@ class CheckNameContext:
 
         if len(reachable_auths) == 0:
             self.ir.error(f"No parent authoritatives reachable")
+            return
         assert self.parent_delegations, "Must have at least one delegation here"
 
         # TODO: what are proper warning levels?
