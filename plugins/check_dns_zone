@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# Upstream: https://github.com/stbuehler/monitoring-plugins-stbuehler
+# Copyright: Stefan Bühler
+# License: MIT
+
 from abc import abstractmethod
 import argparse
 import dataclasses
