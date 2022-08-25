@@ -1,10 +1,35 @@
-monitoring-plugins-stbuehler (0.4) UNRELEASED; urgency=medium
+monitoring-plugins-stbuehler (0.4) unstable; urgency=medium
 
   * check_dns_zone: add --auth-tcp flag
   * check_dns_zone: add --debug flag
   * fix debian dependency: want dnspython, not dns
+  * check_dns_zone: don't warn for duplicate IPs in NS set, but log more details
+  * check_dns_zone: add --expect-auth flag
+  * check_dns_zone: refactor to use context object for check
+  * check_dns_zone: refactor into smaller methods on context
+  * check_dns_zone: support private zones (no delegation check)
+  * check_dns_zone: support custom DNS resolver
+  * check_dns_zone: small fixes
+  * check_dns_zone: fix parent-zone search when more than one labels needs to
+    get traversed
+  * check_dns_zone: use dns.name.Name instead of str through the program
+  * check_dns_zone: show SOA sources, show SOAs always in debug mode
+  * check_dns_zone: use dns.exception.DNSException, convert TCP query EOFError
+  * check_dns_zone: allow one parent NS to be down if there are more than two
+  * check_dns_zone: handle more generic OSErrors from dns
+  * check_dns_zone: small fixes
+  * check_dns_zone: add dns exception handling in (hopefully) all places
+  * check_dns_zone: need early return if no parent auth is reachable
+  * check_dns_zone: another early return needed, use log instead of info
+  * check_dns_zone: handle more errors as 'connection closed'
+  * check_dns_zone: fix parent_ns_set race condition
+  * check_dns_zone: extend unreachable parent NS handling to DS queries
+  * check_dns_zone: catch unknown exception and format them properly for icinga
+  * check_dns_zone: improve exception handling for addresses() (A+AAAA)
+  * check_dns_zone: retry all dns queries two times after two seconds
+  * check_dns_zone: add upstream link / copyright
 
- -- Stefan Bühler <source@stbuehler.de>  Thu, 12 May 2022 12:14:40 +0200
+ -- Stefan Bühler <source@stbuehler.de>  Thu, 25 Aug 2022 11:58:13 +0200
 
 monitoring-plugins-stbuehler (0.3) unstable; urgency=medium
 
