@@ -165,6 +165,52 @@ class Delegation:
                 yield f'* NS {ns} - no glue'
 
 
+ActionResult = typing.TypeVar('ActionResult')
+async def retry_action(
+    action: typing.Callable[[], typing.Awaitable[ActionResult]],
+    *,
+    tries: int = 3,
+    timeout: float = 2.0,
+    continue_exceptions: tuple[type[Exception], ...] = (),
+) -> ActionResult:
+    exc: typing.Optional[Exception] = None
+    result: typing.Union[tuple[()], tuple[ActionResult]] = ()
+
+    if tries < 1:
+        raise ValueError(f"Can't try less than one time")
+
+    async def single(cancel_scope: trio.CancelScope) -> None:
+        nonlocal exc, result
+        try:
+            result = (await action(),)
+            cancel_scope.cancel()
+        except trio.Cancelled:
+            pass
+        except Exception as e:
+            if not isinstance(e, continue_exceptions):
+                # there might be previous exceptions, but they were considered less important
+                # (we continued running after all)
+                exc = e
+                cancel_scope.cancel()
+            elif exc is None:
+                exc = e
+
+    async with trio.open_nursery() as nursery:
+        try:
+            for _ in range(tries):
+                nursery.start_soon(single, nursery.cancel_scope)
+                await trio.sleep(timeout)
+        except trio.Cancelled:
+            pass
+
+    if result:
+        return result[0]
+    elif exc:
+        raise exc
+    else:
+        raise RuntimeError("internal error: Missing both exception and result")
+
+
 class DnsLookup:
     @staticmethod
     def _get_first_system_resolver() -> IPAddress:
@@ -195,15 +241,22 @@ class DnsLookup:
         self._server = server
         self._server_str = str(server)
 
+    async def _single_query(self, query: dns.message.Message) -> tuple[dns.message.Message, bool]:
+        response: dns.message.Message
+        if self._tcp_only:
+            used_tcp = True
+            response = await dns.asyncquery.tcp(query, self._server_str)
+        else:
+            (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
+        return (response, used_tcp)
+
     async def query(self, query: dns.message.Message) -> typing.Tuple[typing.Optional[dns.rrset.RRset], dns.message.Message, bool]:
         try:
-            with trio.fail_after(5):
-                response: dns.message.Message
-                if self._tcp_only:
-                    used_tcp = True
-                    response = await dns.asyncquery.tcp(query, self._server_str)
-                else:
-                    (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
+            with trio.fail_after(9):
+                (response, used_tcp) = await retry_action(
+                    lambda: self._single_query(query),
+                    continue_exceptions=(EOFError, trio.BrokenResourceError, OSError),
+                )
         except (EOFError, trio.BrokenResourceError) as error:
             # with TCP query: server closed connection without answering / too early
             raise DnsConnectionClosedError(query=query, server=self._server, error=error)
