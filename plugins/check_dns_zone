@@ -292,17 +292,29 @@ class DnsLookup:
     async def addresses(self, name: DomainName) -> typing.List[IPAddress]:
         a: typing.Optional[typing.List[IPAddress]] = None
         aaaa: typing.Optional[typing.List[IPAddress]] = None
+        # avoid trio.MultiError: forward first exception we get
+        exc: typing.Optional[Exception] = None
 
         async def get_v4() -> None:
             nonlocal a
-            a = typing.cast(typing.List[IPAddress], await self.ipv4_address(name))
+            try:
+                a = typing.cast(typing.List[IPAddress], await self.ipv4_address(name))
+            except Exception as e:
+                if exc is None:
+                    exc = e
         async def get_v6() -> None:
             nonlocal aaaa
-            aaaa = typing.cast(typing.List[IPAddress], await self.ipv6_address(name))
+            try:
+                aaaa = typing.cast(typing.List[IPAddress], await self.ipv6_address(name))
+            except Exception as e:
+                if exc is None:
+                    exc = e
 
         async with trio.open_nursery() as nursery:
             nursery.start_soon(get_v4)
             nursery.start_soon(get_v6)
+        if not exc is None:
+            raise exc
         assert not a is None, f"get_v4 failed: {a!r}"
         assert not aaaa is None, f"get_v6 failed: {aaaa!r}"
         return a + aaaa
