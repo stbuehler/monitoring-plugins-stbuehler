@@ -410,14 +410,16 @@ class DnsLookup:
 
 class DnsLookupServersCache:
     def __init__(self, *, tcp_only: bool=False):
-        self._servers: dict[IPAddress, DnsLookup] = {}
+        self._servers: dict[tuple[IPAddress, bool], DnsLookup] = {}
         self._tcp_only = tcp_only
 
-    def get(self, address) -> DnsLookup:
-        l = self._servers.get(address, None)
+    def get(self, address: IPAddress, *, tcp_only: bool | tuple[()] = ()) -> DnsLookup:
+        if isinstance(tcp_only, tuple):
+            tcp_only = self._tcp_only
+        l = self._servers.get((address, tcp_only), None)
         if not l:
-            l = DnsLookup(server=address, tcp_only=self._tcp_only)
-            self._servers[address] = l
+            l = DnsLookup(server=address, tcp_only=tcp_only)
+            self._servers[(address, tcp_only)] = l
         return l
 
 
@@ -745,12 +747,42 @@ class CheckNameContext:
             self.ir.error(f'Failed to get SOA for {self.name} from {ns_addr} ({ns_name})')
             self.ir.error(str(e))
             return False
+
         if soa:
             soa_set.insert(soa[0], ns_addr)
-            return True
         else:
             self.ir.error(f'Got no SOA for {self.name} from {ns_addr} ({ns_name})')
             return False
+
+        other_l: DnsLookup | None = None
+        other_msg = ""
+        if self.opts.auth_tcp:
+            if self.opts.host_udp and self.host == ns_name:
+                other_l = self.lookup_servers.get(ns_addr, tcp_only=False)
+                other_msg = "via UDP (after successful TCP)"
+        else:
+            other_l = self.lookup_servers.get(ns_addr, tcp_only=True)
+            other_msg = "via TCP (after successful UDP)"
+
+        if other_l:
+            try:
+                other_soa = await other_l.soa(self.name)
+            except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
+                self.ir.log(f'Failed to get SOA {other_msg} for {self.name} from {ns_addr} ({ns_name})')
+                self.ir.log(str(sys.exception()))
+                return False
+            except dns.exception.DNSException as e:
+                self.ir.error(f'Failed to get SOA {other_msg} for {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(str(e))
+                return False
+            if other_soa != soa:
+                self.ir.error(f"Got different SOA {other_msg}")
+                self.ir.error(f"{other_soa} != {soa}")
+                return False
+            self.ir.debug(f"Successful SOA {other_msg} from {ns_addr} ({ns_name})")
+
+        return True
+
 
     async def retreive_auth_response(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: dns.name.Name) -> bool:
         success = True
@@ -1011,7 +1043,13 @@ class CheckNameContext:
         if self.parent_ds_sets:
             self.ir.log('+ Checked DNSSEC delegation with authoritative')
         if self.main_soa:
-            self.ir.log('+ Checked SOA records')
+            if self.opts.auth_tcp:
+                if self.opts.host and self.opts.host_udp:
+                    self.ir.log(f'+ Checked SOA records via TCP (plus UDP for {self.host})')
+                else:
+                    self.ir.log('+ Checked SOA records via TCP')
+            else:
+                self.ir.log('+ Checked SOA records via UDP + TCP')
 
 
 def main():
@@ -1027,6 +1065,7 @@ def main():
         p.add_argument('--private-entry', action='append', help="Mark given zone name(s) as entry to private zones where delegation isn't checked")
         p.add_argument('--resolver', action='store', help="Use given address as DNS resolver")
         p.add_argument('--host', action='store', help="Make sure zone is hosted on given host")
+        p.add_argument('--host-udp', action='store_true', help="Check SOA via UDP too (when --auth-tcp is used) for nameserver given via --host")
         opts = p.parse_args()
         ir = IcingaResult(debug=opts.debug)
         trio.run(CheckNameContext(ir, opts).check)
