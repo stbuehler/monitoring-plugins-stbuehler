@@ -30,8 +30,8 @@ import trio
 import typing
 
 
-IPAddress = typing.Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
-DomainName = typing.Union[str, dns.name.Name]
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+DomainName = str | dns.name.Name
 
 
 # dns.rrset.RRset
@@ -44,20 +44,20 @@ class RRset(typing.Iterable[T], typing.Protocol[T]):
     covers: int # dns.rdatatype.?
     # dns.rrset.RRset:
     name: DomainName
-    # deleting: typing.Optional[dns.rdataclass.?]
+    # deleting: dns.rdataclass.? | None
 
     @abstractmethod
-    def add(self, rd: T, ttl: typing.Optional[int]=None) -> None:
+    def add(self, rd: T, ttl: int | None = None) -> None:
          ...
 
 
 class IcingaResult:
-    def __init__(self, debug: bool=False) -> None:
+    def __init__(self, debug: bool = False) -> None:
         self._debug = debug
         self._cmp_code = -1.0
         self._code = -1
         self._title = 'OK'
-        self._log: typing.List[str] = []
+        self._log: list[str] = []
 
     def _set(self, code: int, cmp_code: float, title: str) -> None:
         self._cmp_code = cmp_code
@@ -149,16 +149,16 @@ class DnsOsError(dns.exception.DNSException):
 
 @dataclasses.dataclass(frozen=True)
 class Delegation:
-    nameservers_tuple: typing.Tuple[typing.Tuple[dns.name.Name, typing.FrozenSet[IPAddress]], ...]
+    nameservers_tuple: tuple[tuple[dns.name.Name, typing.FrozenSet[IPAddress]], ...]
 
     @staticmethod
-    def _build(nameservers: typing.Dict[dns.name.Name, typing.Set[IPAddress]]) -> 'Delegation':
+    def _build(nameservers: dict[dns.name.Name, set[IPAddress]]) -> 'Delegation':
         return Delegation(
             nameservers_tuple=tuple((ns, frozenset(nameservers[ns])) for ns in sorted(nameservers.keys())),
         )
 
     @property
-    def nameservers(self) -> typing.Dict[dns.name.Name, typing.FrozenSet[IPAddress]]:
+    def nameservers(self) -> dict[dns.name.Name, typing.FrozenSet[IPAddress]]:
         return dict(self.nameservers_tuple)
 
     def to_lines(self) -> typing.Generator[str, None, None]:
@@ -177,8 +177,8 @@ async def retry_action(
     timeout: float = 2.0,
     continue_exceptions: tuple[type[Exception], ...] = (),
 ) -> ActionResult:
-    exc: typing.Optional[Exception] = None
-    result: typing.Union[tuple[()], tuple[ActionResult]] = ()
+    exc: Exception | None = None
+    result: tuple[()] | tuple[ActionResult] = ()
 
     if tries < 1:
         raise ValueError(f"Can't try less than one time")
@@ -222,7 +222,7 @@ class DnsLookup:
         return ipaddress.ip_address(resolver.nameservers[0])
 
     @staticmethod
-    def _extract_answer(query: dns.message.Message, response: dns.message.Message) -> typing.Optional[dns.rrset.RRset]:
+    def _extract_answer(query: dns.message.Message, response: dns.message.Message) -> dns.rrset.RRset | None:
         q_rr: dns.rrset.RRset = query.question[0]
         rr = response.get_rrset(dns.message.ANSWER, q_rr.name, q_rr.rdclass, q_rr.rdtype)
         if rr:
@@ -231,14 +231,14 @@ class DnsLookup:
             rr = response.get_rrset(dns.message.AUTHORITY, q_rr.name, q_rr.rdclass, q_rr.rdtype)
             if rr:
                 return rr
-        cname_rr: typing.Optional[dns.rrset.RRset] = response.get_rrset(dns.message.ANSWER, q_rr.name, dns.rdataclass.ANY, dns.rdatatype.CNAME)
+        cname_rr: dns.rrset.RRset | None = response.get_rrset(dns.message.ANSWER, q_rr.name, dns.rdataclass.ANY, dns.rdatatype.CNAME)
         if not cname_rr:
             return None
         assert len(cname_rr) == 1
         cname_entry: dns.rdtypes.ANY.CNAME.CNAME = cname_rr[0]
         return response.get_rrset(dns.message.ANSWER, cname_entry.target, q_rr.rdclass, q_rr.rdtype)
 
-    def __init__(self, *, server: typing.Optional[IPAddress]=None, tcp_only: bool=False) -> None:
+    def __init__(self, *, server: IPAddress | None = None, tcp_only: bool = False) -> None:
         if server is None:
             server = DnsLookup._get_first_system_resolver()
         self._tcp_only = tcp_only
@@ -254,7 +254,7 @@ class DnsLookup:
             (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
         return (response, used_tcp)
 
-    async def query(self, query: dns.message.Message) -> typing.Tuple[typing.Optional[dns.rrset.RRset], dns.message.Message, bool]:
+    async def query(self, query: dns.message.Message) -> tuple[dns.rrset.RRset | None, dns.message.Message, bool]:
         try:
             with trio.fail_after(9):
                 (response, used_tcp) = await retry_action(
@@ -275,7 +275,7 @@ class DnsLookup:
         answer = DnsLookup._extract_answer(query, response)
         return (answer, response, used_tcp)
 
-    async def soa(self, name: DomainName) -> typing.Optional[RRset[dns.rdtypes.ANY.SOA.SOA]]:
+    async def soa(self, name: DomainName) -> RRset[dns.rdtypes.ANY.SOA.SOA] | None:
         soa_set = (await self.query(dns.message.make_query(name, dns.rdatatype.SOA)))[0]
         if soa_set is None:
             return None
@@ -284,7 +284,7 @@ class DnsLookup:
             assert isinstance(soa, dns.rdtypes.ANY.SOA.SOA)
         return soa_set
 
-    async def ns(self, name: DomainName) -> typing.Optional[RRset[dns.rdtypes.ANY.NS.NS]]:
+    async def ns(self, name: DomainName) -> RRset[dns.rdtypes.ANY.NS.NS] | None:
         ns_set = (await self.query(dns.message.make_query(name, dns.rdatatype.NS)))[0]
         if ns_set is None:
             return None
@@ -292,16 +292,16 @@ class DnsLookup:
             assert isinstance(ns, dns.rdtypes.ANY.NS.NS)
         return ns_set
 
-    async def delegation(self, name: DomainName) -> typing.Optional[Delegation]:
+    async def delegation(self, name: DomainName) -> Delegation | None:
         if isinstance(name, str):
             name = dns.name.from_text(name)
         ns_set, response, _ = await self.query(dns.message.make_query(name, dns.rdatatype.NS))
         if ns_set is None:
             return None
-        nameservers: typing.Dict[dns.name.Name, typing.Set[IPAddress]] = {}
+        nameservers: dict[dns.name.Name, set[IPAddress]] = {}
         for ns in ns_set:
             assert isinstance(ns, dns.rdtypes.ANY.NS.NS)
-            addrs: typing.Set[IPAddress] = set()
+            addrs: set[IPAddress] = set()
             # only accept glue records (addresses for name) if name lives in delegated zone:
             if ns.target.is_subdomain(name):
                 a_set = response.get_rrset(dns.message.ADDITIONAL, ns.target, dns.rdataclass.IN, dns.rdatatype.A)
@@ -315,7 +315,7 @@ class DnsLookup:
             nameservers[ns.target] = addrs
         return Delegation._build(nameservers)
 
-    async def ds(self, name: DomainName) -> typing.Optional[RRset[dns.rdtypes.ANY.DS.DS]]:
+    async def ds(self, name: DomainName) -> RRset[dns.rdtypes.ANY.DS.DS] | None:
         ds_set = (await self.query(dns.message.make_query(name, dns.rdatatype.DS)))[0]
         if ds_set is None:
             return None
@@ -334,35 +334,35 @@ class DnsLookup:
             if ns:
                 return ns
 
-    async def ipv4_address(self, name: DomainName) -> typing.List[ipaddress.IPv4Address]:
+    async def ipv4_address(self, name: DomainName) -> list[ipaddress.IPv4Address]:
         a_set = (await self.query(dns.message.make_query(name, dns.rdatatype.A)))[0]
         if a_set is None:
             return []
         return [ipaddress.IPv4Address(a.address) for a in a_set]
 
-    async def ipv6_address(self, name: DomainName) -> typing.List[ipaddress.IPv6Address]:
+    async def ipv6_address(self, name: DomainName) -> list[ipaddress.IPv6Address]:
         aaaa_set = (await self.query(dns.message.make_query(name, dns.rdatatype.AAAA)))[0]
         if aaaa_set is None:
             return []
         return [ipaddress.IPv6Address(aaaa.address) for aaaa in aaaa_set]
 
-    async def addresses(self, name: DomainName) -> typing.List[IPAddress]:
-        a: typing.Optional[typing.List[IPAddress]] = None
-        aaaa: typing.Optional[typing.List[IPAddress]] = None
+    async def addresses(self, name: DomainName) -> list[IPAddress]:
+        a: list[IPAddress] | None = None
+        aaaa: list[IPAddress] | None = None
         # avoid trio.MultiError: forward first exception we get
-        exc: typing.Optional[Exception] = None
+        exc: Exception | None = None
 
         async def get_v4() -> None:
             nonlocal a
             try:
-                a = typing.cast(typing.List[IPAddress], await self.ipv4_address(name))
+                a = typing.cast(list[IPAddress], await self.ipv4_address(name))
             except Exception as e:
                 if exc is None:
                     exc = e
         async def get_v6() -> None:
             nonlocal aaaa
             try:
-                aaaa = typing.cast(typing.List[IPAddress], await self.ipv6_address(name))
+                aaaa = typing.cast(list[IPAddress], await self.ipv6_address(name))
             except Exception as e:
                 if exc is None:
                     exc = e
@@ -379,7 +379,7 @@ class DnsLookup:
 
 class DnsLookupServersCache:
     def __init__(self, *, tcp_only: bool=False):
-        self._servers: typing.Dict[IPAddress, DnsLookup] = {}
+        self._servers: dict[IPAddress, DnsLookup] = {}
         self._tcp_only = tcp_only
 
     def get(self, address) -> DnsLookup:
@@ -402,40 +402,40 @@ class CheckNameContext:
 
         # List of all NS names for parent zone
         # Filled in `retrieve_parent_addresses`
-        self.parent_ns_set: typing.Set[dns.name.Name] = set()
+        self.parent_ns_set: set[dns.name.Name] = set()
 
         # IP addresses of the authoritative nameservers for the parent zone,
         # and for each address the name it was resolved from.
         # If multiple names resolve to the same address, only a single (random) name is selected.
         # Filled in `retrieve_parent_addresses`
-        self.parent_addresses: typing.Dict[IPAddress, dns.name.Name] = {}
+        self.parent_addresses: dict[IPAddress, dns.name.Name] = {}
 
         # Delegations and DS sets in dictionaries where the key represents values that
         # were found mapping to a list of IPs the values were received from.
         # Filled in `retreive_delegations`
-        self.parent_delegations: typing.Dict[Delegation, typing.List[IPAddress]] = {}
-        self.parent_ds_sets: typing.Dict[typing.FrozenSet[dns.rdtypes.ANY.DS.DS], typing.List[IPAddress]] = {}
+        self.parent_delegations: dict[Delegation, list[IPAddress]] = {}
+        self.parent_ds_sets: dict[typing.FrozenSet[dns.rdtypes.ANY.DS.DS], list[IPAddress]] = {}
 
         # if parent_delegations has exactly one entry, this is its key
         # Set in `check_delegations`
-        self.main_delegation: typing.Optional[Delegation] = None
+        self.main_delegation: Delegation | None = None
 
         # Similar to `parent_delegations`, but results from authoritatives
         # Filled in `retreive_auth_responses`
-        self.auth_delegations: typing.Dict[Delegation, typing.Set[IPAddress]] = {}
-        self.auth_soas: typing.Dict[dns.rdtypes.ANY.SOA.SOA, typing.Set[IPAddress]] = {}
+        self.auth_delegations: dict[Delegation, set[IPAddress]] = {}
+        self.auth_soas: dict[dns.rdtypes.ANY.SOA.SOA, set[IPAddress]] = {}
 
         # if `auth_soas` has single entry, this is its key
         # set in main `check`
-        self.main_soa: typing.Optional[dns.rdtypes.ANY.SOA.SOA] = None
+        self.main_soa: dns.rdtypes.ANY.SOA.SOA | None = None
 
         # `auths` similar to `parent_addresses` - only a single (random) name select per IP
         # set in main `check`
-        self.auths_by_name: typing.Dict[dns.name.Name, typing.Set[IPAddress]] = {}
-        self.auths: typing.Dict[IPAddress, dns.name.Name] = {}
+        self.auths_by_name: dict[dns.name.Name, set[IPAddress]] = {}
+        self.auths: dict[IPAddress, dns.name.Name] = {}
 
     @staticmethod
-    def sources_names(sources: typing.Iterable[IPAddress], names: typing.Dict[IPAddress, typing.Any]) -> str:
+    def sources_names(sources: typing.Iterable[IPAddress], names: dict[IPAddress, typing.Any]) -> str:
         return ', '.join(
             f'{source} ({names[source]})'
             for source in sources
@@ -476,8 +476,8 @@ class CheckNameContext:
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
     async def retreive_delegations(self) -> None:
-        reachable_auths: typing.Set[dns.name.Name] = set()
-        auth_ips_down: typing.Set[IPAddress] = set()
+        reachable_auths: set[dns.name.Name] = set()
+        auth_ips_down: set[IPAddress] = set()
 
         async def get_delegation(ns_addr: IPAddress, ns_name: dns.name.Name):
             r = self.lookup_servers.get(ns_addr)
@@ -543,10 +543,10 @@ class CheckNameContext:
             self.ir.error(f'No Delegations to {self.name} anywhere')
             return
 
-        logged_delegation: typing.Set[Delegation] = set()
+        logged_delegation: set[Delegation] = set()
 
         for delegation, sources in self.parent_delegations.items():
-            missing_glue: typing.Set[dns.name.Name] = set()
+            missing_glue: set[dns.name.Name] = set()
             for ns, addrs in delegation.nameservers_tuple:
                 if not addrs:
                     if ns.is_subdomain(self.name):
@@ -582,14 +582,14 @@ class CheckNameContext:
                 for ds in ds_set:
                     self.ir.log(f'* DS {ds}')
 
-    async def build_merged_delegation(self) -> typing.Dict[dns.name.Name, typing.Set[IPAddress]]:
+    async def build_merged_delegation(self) -> dict[dns.name.Name, set[IPAddress]]:
         """
         Merge all delegations from parent auths to a single set of names mapping to IP addresses.
         Delegations might have different glue; merged all IP addresses returned for a name.
         (Delegations only contain glue addresses if the name is actually in the zone.)
         Additionally lookup all names we didn't find addresses in the delegations for (i.e. no glue).
         """
-        merged_delegation: typing.Dict[dns.name.Name, typing.Set[IPAddress]] = {}
+        merged_delegation: dict[dns.name.Name, set[IPAddress]] = {}
         for delegation in self.parent_delegations:
             for ns, frozen_addrs in delegation.nameservers_tuple:
                 merged_delegation.setdefault(ns, set()).update(frozen_addrs)
@@ -623,9 +623,9 @@ class CheckNameContext:
 
     def transpose_delegation_auths(
         self,
-        auths: typing.Dict[dns.name.Name, typing.Set[IPAddress]],
-    ) -> typing.Dict[IPAddress, dns.name.Name]:
-        result: typing.Dict[IPAddress, dns.name.Name] = {}
+        auths: dict[dns.name.Name, set[IPAddress]],
+    ) -> dict[IPAddress, dns.name.Name]:
+        result: dict[IPAddress, dns.name.Name] = {}
         for ns_name, addrs in auths.items():
             for addr in addrs:
                 if addr in result:
@@ -645,8 +645,8 @@ class CheckNameContext:
                     return True
         return False
 
-    def filter_dnskeys(self, dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> typing.Dict[dns.name.Name, dns.rdataset.Rdataset]:
-        result: typing.List[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
+    def filter_dnskeys(self, dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> dict[dns.name.Name, dns.rdataset.Rdataset]:
+        result: list[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
         for key in dnskey_set:
             if 0 == key.flags & dns.rdtypes.ANY.DNSKEY.ZONE or 3 != key.protocol:
                 continue
@@ -712,7 +712,7 @@ class CheckNameContext:
                     nursery.start_soon(self.check_dnskey, ns_addr, ns_name)
 
     async def check_hidden_primary(self, hm: dns.name.Name) -> None:
-        hm_soas: typing.Dict[dns.rdtypes.ANY.SOA.SOA, typing.Set[IPAddress]] = {}
+        hm_soas: dict[dns.rdtypes.ANY.SOA.SOA, set[IPAddress]] = {}
 
         async def check_soa(ns_addr: IPAddress) -> None:
             l = self.lookup_servers.get(ns_addr)
@@ -790,8 +790,8 @@ class CheckNameContext:
                     return True
         return False
 
-    async def get_private_zone_auths(self) -> typing.Dict[dns.name.Name, typing.Set[IPAddress]]:
-        result: typing.Dict[dns.name.Name, typing.Set[IPAddress]] = {}
+    async def get_private_zone_auths(self) -> dict[dns.name.Name, set[IPAddress]]:
+        result: dict[dns.name.Name, set[IPAddress]] = {}
 
         async def get_ns_addr(ns: dns.name.Name) -> None:
             try:
