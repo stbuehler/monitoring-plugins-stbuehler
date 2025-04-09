@@ -147,7 +147,7 @@ class DnsOsError(dns.exception.DNSException):
         return f"Query @{self.server} {query} failed: {self.error}"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Delegation:
     nameservers_tuple: tuple[tuple[dns.name.Name, typing.FrozenSet[IPAddress]], ...]
 
