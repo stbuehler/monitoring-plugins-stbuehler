@@ -1,3 +1,9 @@
+monitoring-plugins-stbuehler (0.6) unstable; urgency=medium
+
+  * replace dns-czone checkcommand (more arguments, changed variable names)
+
+ -- Stefan Bühler <source@stbuehler.de>  Sun, 13 Apr 2025 13:30:22 +0200
+
 monitoring-plugins-stbuehler (0.5) unstable; urgency=medium
 
   * check_dns_zone: replace some typing.* constructs with native ones
