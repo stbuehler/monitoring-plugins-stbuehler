@@ -1,3 +1,12 @@
+monitoring-plugins-stbuehler (0.5) unstable; urgency=medium
+
+  * check_dns_zone: replace some typing.* constructs with native ones
+  * check_dns_zone: kw_only+slots dataclass
+  * check_dns_zone: add --host argument
+  * check_dns_zone: check UDP + TCP by default; allow checking UDP for explicit host in --auth-tcp mode
+
+ -- Stefan Bühler <source@stbuehler.de>  Sun, 13 Apr 2025 11:17:01 +0200
+
 monitoring-plugins-stbuehler (0.4) unstable; urgency=medium
 
   * check_dns_zone: add --auth-tcp flag
