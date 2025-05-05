@@ -844,6 +844,10 @@ class CheckNameContext:
             self.ir.log(f"All addresses of hidden primary {hm} overlap with addresses of NS set")
             return
 
+        if count_success == 0:
+            self.ir.warn(f"Hidden primary {hm} not reachable")
+            return
+
         if count_success < count_hm_queries:
             # we also want to know if dual-stack isn't working properly, so
             # allowing 50% to fail is not helpful.
