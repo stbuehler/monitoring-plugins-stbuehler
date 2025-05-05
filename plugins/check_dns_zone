@@ -384,14 +384,14 @@ class DnsLookup:
         exc: Exception | None = None
 
         async def get_v4() -> None:
-            nonlocal a
+            nonlocal a, exc
             try:
                 a = typing.cast(list[IPAddress], await self.ipv4_address(name))
             except Exception as e:
                 if exc is None:
                     exc = e
         async def get_v6() -> None:
-            nonlocal aaaa
+            nonlocal aaaa, exc
             try:
                 aaaa = typing.cast(list[IPAddress], await self.ipv6_address(name))
             except Exception as e:
