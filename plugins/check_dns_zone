@@ -691,7 +691,7 @@ class CheckNameContext:
                     return True
         return False
 
-    def filter_dnskeys(self, dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> dict[dns.name.Name, dns.rdataset.Rdataset]:
+    def filter_dnskeys(self, dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> dict[dns.name.Name, dns.rdataset.Rdataset | dns.node.Node]:
         result: list[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
         for key in dnskey_set:
             if 0 == key.flags & dns.rdtypes.ANY.DNSKEY.ZONE or 3 != key.protocol:
@@ -716,12 +716,22 @@ class CheckNameContext:
             self.ir.error(f'Missing DNSKEY for {self.name} from {ns_addr} ({ns_name}) - but delegation is secured by DS')
             return False
         acceptable_dnskeys = self.filter_dnskeys(dnskey_set)
-        rrsig_set = response.get_rrset(dns.message.ANSWER, self.name, dnskey_set.rdclass, dns.rdatatype.RRSIG, dns.rdatatype.DNSKEY)
+        rrsig_set = response.get_rrset(
+            dns.message.ANSWER,
+            self.name,
+            dns.rdataclass.RdataClass(dnskey_set.rdclass),
+            dns.rdatatype.RRSIG,
+            dns.rdatatype.DNSKEY,
+        )
         if not rrsig_set:
             self.ir.error(f'DNSKEY for {self.name} not signed from {ns_addr} ({ns_name})')
             return False
         try:
-            dns.dnssec.validate(dnskey_set, rrsig_set, acceptable_dnskeys)
+            dns.dnssec.validate(
+                typing.cast(dns.rrset.RRset, dnskey_set),
+                rrsig_set,
+                acceptable_dnskeys,
+            )
             self.ir.debug(f'DNSKEY good for {self.name} from {ns_addr} ({ns_name})')
         except dns.dnssec.ValidationFailure:
             self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_addr} ({ns_name})')
