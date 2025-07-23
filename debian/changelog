@@ -1,3 +1,11 @@
+monitoring-plugins-stbuehler (0.7) unstable; urgency=medium
+
+  * check_dns_zone: explicit warning when hidden primary isn't reachable at all
+  * check_dns_zone: fix nonlocal exc variable
+  * check_dns_zone: fix handling of external cancelation (timeout) of retry_action
+
+ -- Stefan Bühler <source@stbuehler.de>  Wed, 23 Jul 2025 11:46:21 +0200
+
 monitoring-plugins-stbuehler (0.6) unstable; urgency=medium
 
   * replace dns-czone checkcommand (more arguments, changed variable names)
