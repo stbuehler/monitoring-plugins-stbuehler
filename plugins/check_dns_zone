@@ -252,7 +252,9 @@ class DnsLookup:
     @staticmethod
     def _get_first_system_resolver() -> IPAddress:
         resolver = dns.resolver.get_default_resolver()
-        return ipaddress.ip_address(resolver.nameservers[0])
+        nameserver = resolver.nameservers[0]
+        assert isinstance(nameserver, str), f"First nameserver must be a string containing an IP, got {nameserver!r}"
+        return ipaddress.ip_address(nameserver)
 
     @staticmethod
     def _extract_answer(query: dns.message.Message, response: dns.message.Message) -> dns.rrset.RRset | None:
