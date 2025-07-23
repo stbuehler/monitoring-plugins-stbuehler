@@ -51,6 +51,10 @@ class RRset(typing.Iterable[T], typing.Protocol[T]):
     def add(self, rd: T, ttl: int | None = None) -> None:
          ...
 
+    @abstractmethod
+    def __getitem__(self, index: int) -> T:
+        ...
+
 
 class IcingaResult:
     def __init__(self, debug: bool = False) -> None:
