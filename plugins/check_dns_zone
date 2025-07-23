@@ -220,7 +220,8 @@ async def retry_action(
             result = (await action(),)
             cancel_scope.cancel()
         except trio.Cancelled:
-            pass
+            if not (result or exc):
+                raise
         except Exception as e:
             if not isinstance(e, continue_exceptions):
                 # there might be previous exceptions, but they were considered less important
@@ -236,7 +237,8 @@ async def retry_action(
                 nursery.start_soon(single, nursery.cancel_scope)
                 await trio.sleep(timeout)
         except trio.Cancelled:
-            pass
+            if not (result or exc):
+                raise
 
     if result:
         return result[0]
