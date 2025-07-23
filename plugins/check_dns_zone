@@ -411,6 +411,14 @@ class DnsLookup:
         assert not aaaa is None, f"get_v6 failed: {aaaa!r}"
         return a + aaaa
 
+    async def dnskey(self, name: DomainName) -> tuple[RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY] | None, dns.message.Message]:
+        dnskey_set, response, _ = await self.query(dns.message.make_query(name, dns.rdatatype.DNSKEY, want_dnssec=True))
+        if dnskey_set is None:
+            return (None, response)
+        for dnskey in dnskey_set:
+            assert isinstance(dnskey, dns.rdtypes.ANY.DNSKEY.DNSKEY)
+        return (typing.cast(RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY], dnskey_set), response)
+
 
 class DnsLookupServersCache:
     def __init__(self, *, tcp_only: bool=False):
@@ -695,7 +703,7 @@ class CheckNameContext:
     async def check_dnskey(self, ns_addr: IPAddress, ns_name: dns.name.Name) -> bool:
         l = self.lookup_servers.get(ns_addr)
         try:
-            dnskey_set, response, _ = await l.query(dns.message.make_query(self.name, dns.rdatatype.DNSKEY, want_dnssec=True))
+            dnskey_set, response = await l.dnskey(self.name)
         except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
             self.ir.log(f'Failed to get DNSKEY for {self.name} from {ns_addr} ({ns_name})')
             self.ir.log(str(sys.exception()))
