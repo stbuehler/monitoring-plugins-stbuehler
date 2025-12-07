@@ -4,7 +4,9 @@
 # Copyright: Stefan Bühler
 # License: MIT
 
-from abc import abstractmethod
+from __future__ import annotations
+
+import abc
 import argparse
 import dataclasses
 import dns
@@ -23,6 +25,8 @@ import dns.rdtypes.ANY.DNSKEY
 import dns.rdtypes.ANY.DS
 import dns.rdtypes.ANY.NS
 import dns.rdtypes.ANY.SOA
+import dns.rdtypes.IN.A
+import dns.rdtypes.IN.AAAA
 import dns.resolver
 import dns.rrset
 import ipaddress
@@ -33,27 +37,6 @@ import typing
 
 IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 DomainName = str | dns.name.Name
-
-
-# dns.rrset.RRset
-T = typing.TypeVar('T', bound=dns.rdata.Rdata)
-class RRset(typing.Iterable[T], typing.Protocol[T]):
-    # dns.rdataset.Rdataset:
-    rdclass: int # dns.rdataclass.?
-    rdtype: int # dns.rdatatype.?
-    ttl: int
-    covers: int # dns.rdatatype.?
-    # dns.rrset.RRset:
-    name: DomainName
-    # deleting: dns.rdataclass.? | None
-
-    @abstractmethod
-    def add(self, rd: T, ttl: int | None = None) -> None:
-         ...
-
-    @abstractmethod
-    def __getitem__(self, index: int) -> T:
-        ...
 
 
 class IcingaResult:
@@ -107,15 +90,463 @@ class IcingaResult:
         sys.exit(self._code)
 
 
-class DnsMessageError(dns.exception.DNSException):
-    def __init__(self, query: dns.message.Message, response: dns.message.Message, server: IPAddress) -> None:
-        self.query = query
-        self.response = response
-        self.server = server
+@dataclasses.dataclass(slots=True, frozen=True, order=True)
+class DnsName:
+    _name: dns.name.Name
+
+    def __init__(self, name: str | dns.name.Name, /) -> None:
+        if isinstance(name, dns.name.Name):
+            object.__setattr__(self, "_name", name)
+        else:
+            object.__setattr__(self, "_name", dns.name.from_text(name))
 
     def __str__(self) -> str:
-        query = self.query.question[0]
-        return f"Query @{self.server} {query} failed with {dns.rcode.to_text(self.response.rcode())}"
+        return str(self._name)
+
+    def __repr__(self) -> str:
+        return repr(self._name)
+
+    def is_subdomain(self, other: DnsName) -> bool:
+        return self._name.is_subdomain(other._name)
+
+    def is_root(self) -> bool:
+        return self._name == dns.name.root
+
+    def parent(self) -> DnsName:
+        return DnsName(self._name.parent())
+
+    @property
+    def labels(self) -> tuple[bytes, ...]:
+        return self._name.labels
+
+
+TDnsRDATA = typing.TypeVar("TDnsRDATA", bound=dns.rdata.Rdata)
+
+
+class RRDataBase(abc.ABC, typing.Generic[TDnsRDATA]):
+    __slots__ = ()
+    _RRDATATYPE: typing.ClassVar[dns.rdatatype.RdataType]
+    _DNS_TYPE: typing.ClassVar[type[TDnsRDATA]]
+
+    @abc.abstractmethod
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass) -> dns.rdata.Rdata:
+        ...
+
+    @classmethod
+    @abc.abstractmethod
+    def _from_dns(cls, rr: TDnsRDATA) -> typing.Self:
+        ...
+
+    @classmethod
+    def _from_dns_set(cls, rrset: dns.rrset.RRset, rrsig_set: dns.rrset.RRset | None) -> RRSet[typing.Self]:
+        data: list[typing.Self] = []
+        for rr in rrset:
+            assert isinstance(rr, cls._DNS_TYPE)
+            data.append(cls._from_dns(rr))
+        rrsig: RRSIG | None = None
+        return RRSet._from_dns(rrset, data, rrsig_set)
+
+    # mypy complains with `You may not have a custom "__lt__" method when "order" is True`
+    @abc.abstractmethod  # type: ignore
+    def __lt__(self, other: typing.Self) -> bool: ...
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataSOA(RRDataBase[dns.rdtypes.ANY.SOA.SOA]):
+    _RRDATATYPE = dns.rdatatype.SOA
+    _DNS_TYPE = dns.rdtypes.ANY.SOA.SOA
+
+    mname: DnsName  # name of primary
+    rname: DnsName  # hostmaster email
+    serial: int
+    # time durations in seconds
+    refresh: int  # secondary refresh interval (checking primary SOA serial)
+    retry: int  # retry of refresh, must be less than refresh
+    expire: int  # time after which secondary should consider zone stale if refresh didn't work
+    minimum: int  # TTL (upper bound) of negative responses (SOA TTL itself is the other upper bound)
+
+    def __str__(self) -> str:
+        return f"SOA {self.mname} {self.rname} {self.serial} {self.refresh} {self.retry} {self.expire} {self.minimum}"
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.ANY.SOA.SOA) -> RRDataSOA:
+        return RRDataSOA(
+            mname=DnsName(rr.mname),
+            rname=DnsName(rr.rname),
+            serial=rr.serial,
+            refresh=rr.refresh,
+            retry=rr.retry,
+            expire=rr.expire,
+            minimum=rr.minimum,
+        )
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass) -> dns.rdtypes.ANY.SOA.SOA:
+        return dns.rdtypes.ANY.SOA.SOA(
+            rdclass=rdclass,
+            rdtype=dns.rdatatype.SOA,
+            mname=self.mname._name,
+            rname=self.rname._name,
+            serial=self.serial,
+            refresh=self.refresh,
+            retry=self.retry,
+            expire=self.expire,
+            minimum=self.minimum,
+        )
+
+    def strip(self, *, strip_mname: bool, strip_serial: bool) -> RRDataSOA_stripped:
+        """
+        When comparing SOAs we might want to ignore certain fields.
+        """
+        return RRDataSOA_stripped(
+            mname=None if strip_mname else self.mname,
+            rname=self.rname,
+            serial=None if strip_serial else self.serial,
+            refresh=self.refresh,
+            retry=self.retry,
+            expire=self.expire,
+            minimum=self.minimum,
+        )
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataSOA_stripped:
+    """
+    When comparing SOAs we might want to ignore certain fields.
+    """
+    mname: DnsName | None
+    rname: DnsName  # hostmaster email
+    serial: int | None
+    # time durations in seconds
+    refresh: int  # secondary refresh interval (checking primary SOA serial)
+    retry: int  # retry of refresh, must be less than refresh
+    expire: int  # time after which secondary should consider zone stale if refresh didn't work
+    minimum: int  # TTL (upper bound) of negative responses (SOA TTL itself is the other upper bound)
+
+    def __str__(self) -> str:
+        mname = "<...>" if self.mname is None else self.mname
+        serial = "<...>" if self.serial is None else self.serial
+        return f"SOA {mname} {self.rname} {serial} {self.refresh} {self.retry} {self.expire} {self.minimum}"
+
+    def unstrip(self, *, default_mname: DnsName, default_serial: int) -> RRDataSOA:
+        return RRDataSOA(
+            mname=default_mname if self.mname is None else self.mname,
+            rname=self.rname,
+            serial=default_serial if self.serial is None else self.serial,
+            refresh=self.refresh,
+            retry=self.retry,
+            expire=self.expire,
+            minimum=self.minimum,
+        )
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataNS(RRDataBase[dns.rdtypes.ANY.NS.NS]):
+    _RRDATATYPE = dns.rdatatype.NS
+    _DNS_TYPE = dns.rdtypes.ANY.NS.NS
+
+    target: DnsName
+
+    def __str__(self) -> str:
+        return f"NS {self.target}"
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.ANY.NS.NS) -> RRDataNS:
+        return RRDataNS(target=DnsName(rr.target))
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass) -> dns.rdtypes.ANY.NS.NS:
+        return dns.rdtypes.ANY.NS.NS(rdclass=rdclass, rdtype=dns.rdatatype.NS, target=self.target._name)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataA(RRDataBase[dns.rdtypes.IN.A.A]):
+    _RRDATATYPE = dns.rdatatype.A
+    _DNS_TYPE = dns.rdtypes.IN.A.A
+
+    address: ipaddress.IPv4Address
+
+    def __str__(self) -> str:
+        return f"A {self.address}"
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.IN.A.A) -> RRDataA:
+        return RRDataA(address=ipaddress.IPv4Address(rr.address))
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass) -> dns.rdtypes.IN.A.A:
+        return dns.rdtypes.IN.A.A(rdclass=rdclass, rdtype=dns.rdatatype.NS, address=self.address)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataAAAA(RRDataBase[dns.rdtypes.IN.AAAA.AAAA]):
+    _RRDATATYPE = dns.rdatatype.AAAA
+    _DNS_TYPE = dns.rdtypes.IN.AAAA.AAAA
+
+    address: ipaddress.IPv6Address
+
+    def __str__(self) -> str:
+        return f"AAAA {self.address}"
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.IN.AAAA.AAAA) -> RRDataAAAA:
+        return RRDataAAAA(address=ipaddress.IPv6Address(rr.address))
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass) -> dns.rdtypes.IN.AAAA.AAAA:
+        return dns.rdtypes.IN.AAAA.AAAA(rdclass=rdclass, rdtype=dns.rdatatype.NS, address=self.address)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataDS(RRDataBase[dns.rdtypes.ANY.DS.DS]):
+    _RRDATATYPE = dns.rdatatype.DS
+    _DNS_TYPE = dns.rdtypes.ANY.DS.DS
+
+    key_tag: int
+    algorithm: dns.dnssectypes.Algorithm
+    digest_type: dns.dnssectypes.DSDigest
+    digest: bytes
+
+    _cached_ds: dns.rdtypes.ANY.DS.DS | None = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+
+    def __str__(self) -> str:
+        return f"DS {self.key_tag} {self.algorithm} {self.digest_type} {self.digest.hex()}"
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.ANY.DS.DS) -> RRDataDS:
+        return RRDataDS(
+            key_tag=rr.key_tag,
+            algorithm=rr.algorithm,
+            digest_type=rr.digest_type,
+            digest=rr.digest,
+            _cached_ds=rr,
+        )
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass) -> dns.rdtypes.ANY.DS.DS:
+        ds = self._cached_ds
+        if ds is None:
+            ds = dns.rdtypes.ANY.DS.DS(
+                rdclass=rdclass,
+                rdtype=dns.rdatatype.DS,
+                key_tag=self.key_tag,
+                algorithm=self.algorithm,
+                digest_type=self.digest_type,
+                digest=self.digest,
+            )
+            setattr(self, "_cached_ds", ds)
+        return ds
+
+    def matches_key(self, name: DnsName, key: RRDataDNSKEY) -> bool:
+        if self.key_tag != key.key_tag or self.algorithm != key.algorithm:
+            return False
+        cmp_ds = dns.dnssec.make_ds(name._name, key._to_dns(), self.digest_type)
+        return cmp_ds.digest == self.digest
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataDNSKEY(RRDataBase[dns.rdtypes.ANY.DNSKEY.DNSKEY]):
+    _RRDATATYPE = dns.rdatatype.DNSKEY
+    _DNS_TYPE = dns.rdtypes.ANY.DNSKEY.DNSKEY
+
+    flags: int
+    protocol: int
+    algorithm: dns.dnssectypes.Algorithm
+    key: bytes
+    _cached_key_tag: int | None = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+    _cached_dns_key: dns.rdtypes.ANY.DNSKEY.DNSKEY | None = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+
+    def __str__(self) -> str:
+        return f"DNSKEY {self.flags} {self.protocol} {self.algorithm} {self.key.hex()}"
+
+    @property
+    def key_tag(self) -> int:
+        key_id = self._cached_key_tag
+        if key_id is None:
+            key_id = dns.dnssec.key_id(self._to_dns())
+            super(RRDataDNSKEY, self).__setattr__("_cached_key_tag", key_id)
+        return key_id
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.ANY.DNSKEY.DNSKEY) -> RRDataDNSKEY:
+        return RRDataDNSKEY(
+            flags=rr.flags,
+            protocol=rr.protocol,
+            algorithm=rr.algorithm,
+            key=rr.key,
+            _cached_dns_key=rr,
+        )
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass = dns.rdataclass.IN) -> dns.rdtypes.ANY.DNSKEY.DNSKEY:
+        dns_key = self._cached_dns_key
+        if dns_key is None:
+            dns_key = dns.rdtypes.ANY.DNSKEY.DNSKEY(
+                rdclass=rdclass,
+                rdtype=dns.rdatatype.DNSKEY,
+                flags=self.flags,
+                protocol=self.protocol,
+                algorithm=self.algorithm,
+                key=self.key,
+            )
+            super(RRDataDNSKEY, self).__setattr__("_cached_dns_key", dns_key)
+        return dns_key
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
+class RRDataRRSIG(RRDataBase[dns.rdtypes.ANY.RRSIG.RRSIG]):
+    _RRDATATYPE = dns.rdatatype.RRSIG
+    _DNS_TYPE = dns.rdtypes.ANY.RRSIG.RRSIG
+
+    _wire_data: bytes
+    _cached_rrsig: dns.rdtypes.ANY.RRSIG.RRSIG | None = dataclasses.field(default=None, repr=False, hash=False, compare=False)
+
+    def __str__(self) -> str:
+        return "RRSIG <...>"
+
+    @staticmethod
+    def _from_dns(rr: dns.rdtypes.ANY.RRSIG.RRSIG) -> RRDataRRSIG:
+        wire_data = rr.to_wire()
+        assert wire_data
+        return RRDataRRSIG(
+            _wire_data=wire_data,
+            _cached_rrsig=rr,
+        )
+
+    def _to_dns(self, *, rdclass: dns.rdataclass.RdataClass = dns.rdataclass.IN) -> dns.rdtypes.ANY.RRSIG.RRSIG:
+        rrsig = self._cached_rrsig
+        if rrsig is None:
+            rdata = dns.rdata.from_wire(
+                rdclass=rdclass,
+                rdtype=dns.rdatatype.RRSIG,
+                wire=self._wire_data,
+                current=0,
+                rdlen=len(self._wire_data),
+            )
+            assert isinstance(rdata, dns.rdtypes.ANY.RRSIG.RRSIG)
+            rrsig = rdata
+            super(RRDataRRSIG, self).__setattr__("_cached_rrsig", rrsig)
+        return rrsig
+
+
+TRRData = typing.TypeVar("TRRData", bound=RRDataBase)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class RRSIG:
+    name: DnsName
+    _rrsig_set: dns.rdataset.ImmutableRdataset
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class RR(typing.Generic[TRRData]):
+    name: DnsName
+    ttl: int
+    rdclass: dns.rdataclass.RdataClass
+    data: TRRData
+
+    @staticmethod
+    def _from_dns(rrset: dns.rrset.RRset, data: TRRData) -> RR[TRRData]:
+        return RR(name=DnsName(rrset.name), ttl=rrset.ttl, rdclass=rrset.rdclass, data=data)
+
+    def __str__(self) -> str:
+        return f"{self.name} {self.ttl} {self.rdclass} {self.data}"
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class RRSet(typing.Generic[TRRData]):
+    name: DnsName
+    ttl: int
+    rdclass: dns.rdataclass.RdataClass
+    data: tuple[TRRData, ...]
+    rrsig: RRSet[RRDataRRSIG] | None = None
+
+    @staticmethod
+    def _from_dns(
+        rrset: dns.rrset.RRset,
+        data: typing.Sequence[TRRData],
+        rrsig_set: dns.rrset.RRset | None,
+    ) -> RRSet[TRRData]:
+        name = DnsName(rrset.name)
+        rrsig: RRSet[RRDataRRSIG] | None = None
+        if rrsig_set:
+            rrsig = RRDataRRSIG._from_dns_set(rrsig_set, None)
+        return RRSet(
+            name=name,
+            ttl=rrset.ttl,
+            rdclass=rrset.rdclass,
+            data=tuple(sorted(data)),
+            rrsig=rrsig,
+        )
+
+    def _to_dns(self) -> dns.rrset.RRset:
+        return dns.rrset.from_rdata_list(
+            name=self.name._name,
+            ttl=self.ttl,
+            rdatas=[rr._to_dns(rdclass=self.rdclass) for rr in self.data],
+        )
+
+    def rrs(self) -> list[RR[TRRData]]:
+        return [RR(name=self.name, ttl=self.ttl, rdclass=self.rdclass, data=entry) for entry in self.data]
+
+    def __iter__(self) -> typing.Iterator[TRRData]:
+        return iter(self.data)
+
+    def validate_with_keys(self, dnskey_set: RRSet[RRDataDNSKEY]) -> bool:
+        assert self.rrsig
+        try:
+            dns.dnssec.validate(
+                self._to_dns(),
+                (self.rrsig.name._name, self.rrsig._to_dns()),
+                { dnskey_set.name._name: dnskey_set._to_dns() },
+            )
+        except dns.dnssec.ValidationFailure:
+            return False
+        return True
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class DSDelegation:
+    name: DnsName
+    ds_set: frozenset[RRDataDS]
+
+    def _filter_dnskeys(
+        self,
+        dnskey_set: RRSet[RRDataDNSKEY],
+    ) -> dict[dns.name.Name, dns.rdataset.Rdataset | dns.node.Node]:
+        result: list[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
+        for key in dnskey_set:
+            if 0 == key.flags & dns.rdtypes.ANY.DNSKEY.ZONE or 3 != key.protocol:
+                continue
+            if any(ds.matches_key(self.name, key) for ds in self.ds_set):
+                result.append(key._to_dns())
+        return { self.name._name: dns.rdataset.from_rdata_list(dnskey_set.ttl, result) }
+
+    def validate_zone_keys(self, dnskey_set: RRSet[RRDataDNSKEY]) -> bool:
+        assert dnskey_set.rrsig
+        acceptable_dnskeys = self._filter_dnskeys(dnskey_set)
+        try:
+            dns.dnssec.validate(
+                dnskey_set._to_dns(),
+                (dnskey_set.rrsig.name._name, dnskey_set.rrsig._to_dns()),
+                acceptable_dnskeys,
+            )
+        except dns.dnssec.ValidationFailure:
+            return False
+        return True
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class DnsTransaction:
+    server: IPAddress
+    query: dns.message.QueryMessage
+    response: dns.message.Message
+    used_tcp: bool
+
+
+class DnsMessageError(dns.exception.DNSException):
+    def __init__(self, transaction: DnsTransaction) -> None:
+        self.transaction = transaction
+
+    def __str__(self) -> str:
+        server = self.transaction.server
+        query = self.transaction.query.question[0]
+        response = self.transaction.response
+        return f"Query @{server} {query} failed with {dns.rcode.to_text(response.rcode())}"
 
 
 class DnsTimeoutError(dns.exception.DNSException):
@@ -151,18 +582,28 @@ class DnsOsError(dns.exception.DNSException):
         return f"Query @{self.server} {query} failed: {self.error}"
 
 
+class DnsInvalidResponseError(dns.exception.DNSException):
+    def __init__(self, transaction: DnsTransaction, error: str) -> None:
+        self.transaction = transaction
+        self.error = error
+
+    def __str__(self) -> str:
+        query = self.transaction.query.question[0]
+        return f"Query @{self.transaction.server} {query} failed: {self.error}"
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class Delegation:
-    nameservers_tuple: tuple[tuple[dns.name.Name, typing.FrozenSet[IPAddress]], ...]
+    nameservers_tuple: tuple[tuple[DnsName, typing.FrozenSet[IPAddress]], ...]
 
     @staticmethod
-    def _build(nameservers: dict[dns.name.Name, set[IPAddress]]) -> 'Delegation':
+    def _build(nameservers: dict[DnsName, set[IPAddress]]) -> 'Delegation':
         return Delegation(
             nameservers_tuple=tuple((ns, frozenset(nameservers[ns])) for ns in sorted(nameservers.keys())),
         )
 
     @property
-    def nameservers(self) -> dict[dns.name.Name, typing.FrozenSet[IPAddress]]:
+    def nameservers(self) -> dict[DnsName, typing.FrozenSet[IPAddress]]:
         return dict(self.nameservers_tuple)
 
     def to_lines(self) -> typing.Generator[str, None, None]:
@@ -175,29 +616,29 @@ class Delegation:
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class SoaSets:
-    soa_sets: dict[dns.rdtypes.ANY.SOA.SOA, set[IPAddress]] = dataclasses.field(default_factory=dict)
+    soa_sets: dict[RRDataSOA, set[IPAddress]] = dataclasses.field(default_factory=dict)
     serials: set[int] = dataclasses.field(default_factory=set)
-    mnames: set[dns.name.Name] = dataclasses.field(default_factory=set)
-    _min_soas: set[dns.rdtypes.ANY.SOA.SOA] = dataclasses.field(default_factory=set)
+    mnames: set[DnsName] = dataclasses.field(default_factory=set)
+    _min_soas: set[RRDataSOA_stripped] = dataclasses.field(default_factory=set)
 
-    def insert(self, soa: dns.rdtypes.ANY.SOA.SOA, address: IPAddress) -> None:
+    def insert(self, soa: RRDataSOA, address: IPAddress) -> None:
         # remember full SOAs
         self.soa_sets.setdefault(soa, set()).add(address)
         # remember serials and mnames
         self.serials.add(soa.serial)
         self.mnames.add(soa.mname)
         # remember minimized SOA (without mname and serial) to count "really distinct" SOAs
-        self._min_soas.add(typing.cast(dns.rdtypes.ANY.SOA.SOA, soa.replace(serial=1, mname=dns.name.root)))
+        self._min_soas.add(soa.strip(strip_mname=True, strip_serial=True))
 
-    def main_soa(self) -> dns.rdtypes.ANY.SOA.SOA | None:
+    def main_soa(self) -> RRDataSOA | None:
         if self.distinct_soas != 1:
             return None
         base_soa = next(iter(self._min_soas))
         # combination of serial and mname not necessarily seen in self.soa_sets
-        return typing.cast(dns.rdtypes.ANY.SOA.SOA, base_soa.replace(
-            serial=max(self.serials),
-            mname=next(iter(self.mnames)),  # select random mname
-        ))
+        return base_soa.unstrip(
+            default_mname=next(iter(self.mnames)),  # select random mname
+            default_serial=max(self.serials),
+        )
 
     @property
     def distinct_soas(self) -> int:
@@ -293,7 +734,7 @@ class DnsLookup:
             (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
         return (response, used_tcp)
 
-    async def query(self, query: dns.message.Message) -> tuple[dns.rrset.RRset | None, dns.message.Message, bool]:
+    async def _untyped_query(self, query: dns.message.QueryMessage) -> tuple[dns.rrset.RRset | None, DnsTransaction]:
         try:
             with trio.fail_after(9):
                 (response, used_tcp) = await retry_action(
@@ -308,100 +749,105 @@ class DnsLookup:
             raise DnsOsError(query=query, server=self._server, error=error)
         except trio.TooSlowError:
             raise DnsTimeoutError(query=query, server=self._server)
+
+        tx = DnsTransaction(server=self._server, query=query, response=response, used_tcp=used_tcp)
         rcode = response.rcode()
         if not rcode in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
-            raise DnsMessageError(query=query, response=response, server=self._server)
+            raise DnsMessageError(transaction=tx)
         answer = DnsLookup._extract_answer(query, response)
-        return (answer, response, used_tcp)
+        return answer, tx
 
-    async def soa(self, name: DomainName) -> RRset[dns.rdtypes.ANY.SOA.SOA] | None:
-        soa_set = (await self.query(dns.message.make_query(name, dns.rdatatype.SOA)))[0]
+    async def query(
+        self,
+        name: DnsName,
+        rrdata: type[TRRData],
+    ) -> tuple[RRSet[TRRData] | None, DnsTransaction]:
+        query = dns.message.make_query(name._name, rrdata._RRDATATYPE, want_dnssec=True)
+        answer, tx = await self._untyped_query(query)
+        if answer is None:
+            return None, tx
+        rrsig_set = tx.response.get_rrset(
+            dns.message.ANSWER,
+            name._name,
+            dns.rdataclass.IN,
+            dns.rdatatype.RRSIG,
+            rrdata._RRDATATYPE,
+        )
+        return rrdata._from_dns_set(answer, rrsig_set), tx
+
+    async def soa(self, name: DnsName) -> RR[RRDataSOA] | None:
+        soa_set, tx = await self.query(name, RRDataSOA)
         if soa_set is None:
             return None
-        assert len(soa_set) == 1
-        for soa in soa_set:
-            assert isinstance(soa, dns.rdtypes.ANY.SOA.SOA)
-        return typing.cast(RRset[dns.rdtypes.ANY.SOA.SOA], soa_set)
+        soa_rrs = soa_set.rrs()
+        if len(soa_rrs) != 1:
+            raise DnsInvalidResponseError(transaction=tx, error="Not exactly one record in answer for SOA")
+        return soa_rrs[0]
 
-    async def ns(self, name: DomainName) -> RRset[dns.rdtypes.ANY.NS.NS] | None:
-        ns_set = (await self.query(dns.message.make_query(name, dns.rdatatype.NS)))[0]
+    async def ns(self, name: DnsName) -> RRSet[RRDataNS] | None:
+        return (await self.query(name, RRDataNS))[0]
+
+    async def delegation(self, name: DnsName) -> Delegation | None:
+        ns_set, tx = await self.query(name, RRDataNS)
         if ns_set is None:
             return None
+        nameservers: dict[DnsName, set[IPAddress]] = {}
         for ns in ns_set:
-            assert isinstance(ns, dns.rdtypes.ANY.NS.NS)
-        return typing.cast(RRset[dns.rdtypes.ANY.NS.NS], ns_set)
-
-    async def delegation(self, name: DomainName) -> Delegation | None:
-        if isinstance(name, str):
-            name = dns.name.from_text(name)
-        ns_set, response, _ = await self.query(dns.message.make_query(name, dns.rdatatype.NS))
-        if ns_set is None:
-            return None
-        nameservers: dict[dns.name.Name, set[IPAddress]] = {}
-        for ns in ns_set:
-            assert isinstance(ns, dns.rdtypes.ANY.NS.NS)
             addrs: set[IPAddress] = set()
             # only accept glue records (addresses for name) if name lives in delegated zone:
             if ns.target.is_subdomain(name):
-                a_set = response.get_rrset(dns.message.ADDITIONAL, ns.target, dns.rdataclass.IN, dns.rdatatype.A)
+                a_set = tx.response.get_rrset(dns.message.ADDITIONAL, ns.target._name, dns.rdataclass.IN, dns.rdatatype.A)
                 if a_set:
-                    for a in a_set:
+                    for a in sorted(a_set):
                         addrs.add(ipaddress.IPv4Address(a.address))
-                aaaa_set = response.get_rrset(dns.message.ADDITIONAL, ns.target, dns.rdataclass.IN, dns.rdatatype.AAAA)
+                aaaa_set = tx.response.get_rrset(dns.message.ADDITIONAL, ns.target._name, dns.rdataclass.IN, dns.rdatatype.AAAA)
                 if aaaa_set:
-                    for aaaa in aaaa_set:
+                    for aaaa in sorted(aaaa_set):
                         addrs.add(ipaddress.IPv6Address(aaaa.address))
             nameservers[ns.target] = addrs
         return Delegation._build(nameservers)
 
-    async def ds(self, name: DomainName) -> RRset[dns.rdtypes.ANY.DS.DS] | None:
-        ds_set = (await self.query(dns.message.make_query(name, dns.rdatatype.DS)))[0]
-        if ds_set is None:
-            return None
-        for ds in ds_set:
-            assert isinstance(ds, dns.rdtypes.ANY.DS.DS)
-        return typing.cast(RRset[dns.rdtypes.ANY.DS.DS], ds_set)
+    async def ds(self, name: DnsName) -> RRSet[RRDataDS] | None:
+        return (await self.query(name, RRDataDS))[0]
 
-    async def find_parent_zone(self, name: DomainName) -> RRset[dns.rdtypes.ANY.NS.NS]:
-        if isinstance(name, str):
-            name = dns.name.from_text(name)
-        assert name != dns.name.root, f"Can't get parent of root: {name!r}"
-        parent = name
+    async def find_parent_zone(self, name: DnsName) -> RRSet[RRDataNS]:
+        assert name._name != dns.name.root, f"Can't get parent of root: {name!r}"
+        parent = name._name
         while True:
             parent = parent.parent()
-            ns = await self.ns(parent)
+            ns = await self.ns(DnsName(parent))
             if ns:
                 return ns
 
-    async def ipv4_address(self, name: DomainName) -> list[ipaddress.IPv4Address]:
-        a_set = (await self.query(dns.message.make_query(name, dns.rdatatype.A)))[0]
+    async def ipv4_address(self, name: DnsName) -> list[ipaddress.IPv4Address]:
+        a_set = (await self.query(name, RRDataA))[0]
         if a_set is None:
             return []
         return [ipaddress.IPv4Address(a.address) for a in a_set]
 
-    async def ipv6_address(self, name: DomainName) -> list[ipaddress.IPv6Address]:
-        aaaa_set = (await self.query(dns.message.make_query(name, dns.rdatatype.AAAA)))[0]
+    async def ipv6_address(self, name: DnsName) -> list[ipaddress.IPv6Address]:
+        aaaa_set = (await self.query(name, RRDataAAAA))[0]
         if aaaa_set is None:
             return []
         return [ipaddress.IPv6Address(aaaa.address) for aaaa in aaaa_set]
 
-    async def addresses(self, name: DomainName) -> list[IPAddress]:
-        a: list[IPAddress] | None = None
-        aaaa: list[IPAddress] | None = None
+    async def addresses(self, name: DnsName) -> list[IPAddress]:
+        a: list[ipaddress.IPv4Address] | None = None
+        aaaa: list[ipaddress.IPv6Address] | None = None
         # avoid trio.MultiError: forward first exception we get
         exc: Exception | None = None
 
         async def get_v4() -> None:
             nonlocal a, exc
             try:
-                a = typing.cast(list[IPAddress], await self.ipv4_address(name))
+                a = await self.ipv4_address(name)
             except Exception as e:
                 if exc is None:
                     exc = e
         async def get_v6() -> None:
             nonlocal aaaa, exc
             try:
-                aaaa = typing.cast(list[IPAddress], await self.ipv6_address(name))
+                aaaa = await self.ipv6_address(name)
             except Exception as e:
                 if exc is None:
                     exc = e
@@ -413,15 +859,10 @@ class DnsLookup:
             raise exc
         assert not a is None, f"get_v4 failed: {a!r}"
         assert not aaaa is None, f"get_v6 failed: {aaaa!r}"
-        return a + aaaa
+        return [*a, *aaaa]
 
-    async def dnskey(self, name: DomainName) -> tuple[RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY] | None, dns.message.Message]:
-        dnskey_set, response, _ = await self.query(dns.message.make_query(name, dns.rdatatype.DNSKEY, want_dnssec=True))
-        if dnskey_set is None:
-            return (None, response)
-        for dnskey in dnskey_set:
-            assert isinstance(dnskey, dns.rdtypes.ANY.DNSKEY.DNSKEY)
-        return (typing.cast(RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY], dnskey_set), response)
+    async def dnskey(self, name: DnsName) -> tuple[RRSet[RRDataDNSKEY] | None, DnsTransaction]:
+        return await self.query(name, RRDataDNSKEY)
 
 
 class DnsLookupServersCache:
@@ -443,28 +884,28 @@ class CheckNameContext:
     def __init__(self, ir: IcingaResult, opts: argparse.Namespace) -> None:
         self.ir = ir
         self.opts = opts
-        self.name = dns.name.from_text(opts.zone)
+        self.name = DnsName(opts.zone)
         self.resolver = DnsLookup(server=opts.resolver)
         self.lookup_servers = DnsLookupServersCache(tcp_only=opts.auth_tcp)
-        self.host = dns.name.from_text(opts.host) if opts.host else None
+        self.host = DnsName(opts.host) if opts.host else None
 
         #### Values we fill during lookup ####
 
         # List of all NS names for parent zone
         # Filled in `retrieve_parent_addresses`
-        self.parent_ns_set: set[dns.name.Name] = set()
+        self.parent_ns_set: set[DnsName] = set()
 
         # IP addresses of the authoritative nameservers for the parent zone,
         # and for each address the name it was resolved from.
         # If multiple names resolve to the same address, only a single (random) name is selected.
         # Filled in `retrieve_parent_addresses`
-        self.parent_addresses: dict[IPAddress, dns.name.Name] = {}
+        self.parent_addresses: dict[IPAddress, DnsName] = {}
 
         # Delegations and DS sets in dictionaries where the key represents values that
         # were found mapping to a list of IPs the values were received from.
         # Filled in `retreive_delegations`
         self.parent_delegations: dict[Delegation, list[IPAddress]] = {}
-        self.parent_ds_sets: dict[typing.FrozenSet[dns.rdtypes.ANY.DS.DS], list[IPAddress]] = {}
+        self.parent_ds_sets: dict[DSDelegation, list[IPAddress]] = {}
 
         # if parent_delegations has exactly one entry, this is its key
         # Set in `check_delegations`
@@ -477,12 +918,12 @@ class CheckNameContext:
 
         # if `auth_soas` has single entry (ignoring serial and mname)
         # set in main `check`
-        self.main_soa: dns.rdtypes.ANY.SOA.SOA | None = None
+        self.main_soa: RRDataSOA | None = None
 
         # `auths` similar to `parent_addresses` - only a single (random) name select per IP
         # set in main `check`
-        self.auths_by_name: dict[dns.name.Name, set[IPAddress]] = {}
-        self.auths: dict[IPAddress, dns.name.Name] = {}
+        self.auths_by_name: dict[DnsName, set[IPAddress]] = {}
+        self.auths: dict[IPAddress, DnsName] = {}
 
     @staticmethod
     def sources_names(sources: typing.Iterable[IPAddress], names: dict[IPAddress, typing.Any]) -> str:
@@ -500,7 +941,7 @@ class CheckNameContext:
             return
         self.ir.debug(f'NS for parent zone {parent_ns_rrset.name} of {self.name}: ' + ' '.join(str(ns.target) for ns in parent_ns_rrset))
 
-        async def get_parent_ns_addr(parent_ns: dns.name.Name) -> None:
+        async def get_parent_ns_addr(parent_ns: DnsName) -> None:
             try:
                 addresses = await self.resolver.addresses(parent_ns)
                 self.ir.debug(f'Addresses of NS {parent_ns}: ' + ' '.join(str(addr) for addr in addresses))
@@ -526,10 +967,10 @@ class CheckNameContext:
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
     async def retreive_delegations(self) -> None:
-        reachable_auths: set[dns.name.Name] = set()
+        reachable_auths: set[DnsName] = set()
         auth_ips_down: set[IPAddress] = set()
 
-        async def get_delegation(ns_addr: IPAddress, ns_name: dns.name.Name):
+        async def get_delegation(ns_addr: IPAddress, ns_name: DnsName):
             r = self.lookup_servers.get(ns_addr)
             try:
                 delegation = await r.delegation(self.name)
@@ -558,8 +999,8 @@ class CheckNameContext:
                 self.ir.error(str(e))
                 return
             if not ds is None:
-                ds_set = frozenset(ds)
-                self.parent_ds_sets.setdefault(ds_set, []).append(ns_addr)
+                ds_deleg = DSDelegation(name=self.name, ds_set=frozenset(ds))
+                self.parent_ds_sets.setdefault(ds_deleg, []).append(ns_addr)
             reachable_auths.add(ns_name)
 
         async with trio.open_nursery() as nursery:
@@ -596,7 +1037,7 @@ class CheckNameContext:
         logged_delegation: set[Delegation] = set()
 
         for delegation, sources in self.parent_delegations.items():
-            missing_glue: set[dns.name.Name] = set()
+            missing_glue: set[DnsName] = set()
             for ns, addrs in delegation.nameservers_tuple:
                 if not addrs:
                     if ns.is_subdomain(self.name):
@@ -627,24 +1068,24 @@ class CheckNameContext:
         elif len(self.parent_ds_sets) > 1:
             self.ir.warn(f'Different DS record sets to {self.name}')
         if len(self.parent_ds_sets) > 1 or self.ir._debug:
-            for ds_set, sources in self.parent_ds_sets.items():
+            for dsdeleg, sources in self.parent_ds_sets.items():
                 self.ir.log(f'DS set from {self.sources_names(sources, self.parent_addresses)}:')
-                for ds in ds_set:
-                    self.ir.log(f'* DS {ds}')
+                for ds in dsdeleg.ds_set:
+                    self.ir.log(f'* {ds}')
 
-    async def build_merged_delegation(self) -> dict[dns.name.Name, set[IPAddress]]:
+    async def build_merged_delegation(self) -> dict[DnsName, set[IPAddress]]:
         """
         Merge all delegations from parent auths to a single set of names mapping to IP addresses.
         Delegations might have different glue; merged all IP addresses returned for a name.
         (Delegations only contain glue addresses if the name is actually in the zone.)
         Additionally lookup all names we didn't find addresses in the delegations for (i.e. no glue).
         """
-        merged_delegation: dict[dns.name.Name, set[IPAddress]] = {}
+        merged_delegation: dict[DnsName, set[IPAddress]] = {}
         for delegation in self.parent_delegations:
             for ns, frozen_addrs in delegation.nameservers_tuple:
                 merged_delegation.setdefault(ns, set()).update(frozen_addrs)
 
-        async def get_unglued_ns_addr(ns: dns.name.Name) -> None:
+        async def get_unglued_ns_addr(ns: DnsName) -> None:
             if ns.is_subdomain(self.name):
                 # missing glue - logged above.
                 return
@@ -673,9 +1114,9 @@ class CheckNameContext:
 
     def transpose_delegation_auths(
         self,
-        auths: dict[dns.name.Name, set[IPAddress]],
-    ) -> dict[IPAddress, dns.name.Name]:
-        result: dict[IPAddress, dns.name.Name] = {}
+        auths: dict[DnsName, set[IPAddress]],
+    ) -> dict[IPAddress, DnsName]:
+        result: dict[IPAddress, DnsName] = {}
         for ns_name, addrs in auths.items():
             for addr in addrs:
                 if addr in result:
@@ -684,30 +1125,10 @@ class CheckNameContext:
                     result[addr] = ns_name
         return result
 
-    def is_dnskey_in_dssets(self, key: dns.rdtypes.ANY.DNSKEY.DNSKEY) -> bool:
-        key_id = dns.dnssec.key_id(key)
-        for ds_set in self.parent_ds_sets:
-            for ds in ds_set:
-                if ds.key_tag != key_id or ds.algorithm != key.algorithm:
-                    continue
-                cmp_ds = dns.dnssec.make_ds(self.name, key, ds.digest_type)
-                if cmp_ds.digest == ds.digest:
-                    return True
-        return False
-
-    def filter_dnskeys(self, dnskey_set: RRset[dns.rdtypes.ANY.DNSKEY.DNSKEY]) -> dict[dns.name.Name, dns.rdataset.Rdataset | dns.node.Node]:
-        result: list[dns.rdtypes.ANY.DNSKEY.DNSKEY] = []
-        for key in dnskey_set:
-            if 0 == key.flags & dns.rdtypes.ANY.DNSKEY.ZONE or 3 != key.protocol:
-                continue
-            if self.is_dnskey_in_dssets(key):
-                result.append(key)
-        return { self.name: dns.rdataset.from_rdata_list(dnskey_set.ttl, result) }
-
-    async def check_dnskey(self, ns_addr: IPAddress, ns_name: dns.name.Name) -> bool:
+    async def check_dnskey(self, ns_addr: IPAddress, ns_name: DnsName) -> bool:
         l = self.lookup_servers.get(ns_addr)
         try:
-            dnskey_set, response = await l.dnskey(self.name)
+            dnskey_set, tx = await l.dnskey(self.name)
         except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
             self.ir.log(f'Failed to get DNSKEY for {self.name} from {ns_addr} ({ns_name})')
             self.ir.log(str(sys.exception()))
@@ -719,30 +1140,18 @@ class CheckNameContext:
         if not dnskey_set:
             self.ir.error(f'Missing DNSKEY for {self.name} from {ns_addr} ({ns_name}) - but delegation is secured by DS')
             return False
-        acceptable_dnskeys = self.filter_dnskeys(dnskey_set)
-        rrsig_set = response.get_rrset(
-            dns.message.ANSWER,
-            self.name,
-            dns.rdataclass.RdataClass(dnskey_set.rdclass),
-            dns.rdatatype.RRSIG,
-            dns.rdatatype.DNSKEY,
-        )
-        if not rrsig_set:
+        if not dnskey_set.rrsig:
             self.ir.error(f'DNSKEY for {self.name} not signed from {ns_addr} ({ns_name})')
             return False
-        try:
-            dns.dnssec.validate(
-                typing.cast(dns.rrset.RRset, dnskey_set),
-                rrsig_set,
-                acceptable_dnskeys,
-            )
-            self.ir.debug(f'DNSKEY good for {self.name} from {ns_addr} ({ns_name})')
-        except dns.dnssec.ValidationFailure:
-            self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_addr} ({ns_name})')
-            return False
+        for dsdeleg, parents in self.parent_ds_sets.items():
+            if dsdeleg.validate_zone_keys(dnskey_set):
+                self.ir.debug(f'DNSKEY good for {self.name} from {ns_addr} ({ns_name}) from DS from {parents}')
+            else:
+                self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_addr} ({ns_name}) from DS from {parents}')
+                return False
         return True
 
-    async def retrieve_auth_delegation(self, ns_addr: IPAddress, ns_name: dns.name.Name) -> bool:
+    async def retrieve_auth_delegation(self, ns_addr: IPAddress, ns_name: DnsName) -> bool:
         l = self.lookup_servers.get(ns_addr)
         try:
             delegation = await l.delegation(self.name)
@@ -761,7 +1170,7 @@ class CheckNameContext:
             self.ir.error(f'Got no delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
             return False
 
-    async def get_soa_into(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: dns.name.Name) -> bool:
+    async def get_soa_into(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: DnsName) -> bool:
         l = self.lookup_servers.get(ns_addr)
         try:
             soa = await l.soa(self.name)
@@ -775,7 +1184,7 @@ class CheckNameContext:
             return False
 
         if soa:
-            soa_set.insert(soa[0], ns_addr)
+            soa_set.insert(soa.data, ns_addr)
         else:
             self.ir.error(f'Got no SOA for {self.name} from {ns_addr} ({ns_name})')
             return False
@@ -810,7 +1219,7 @@ class CheckNameContext:
         return True
 
 
-    async def retreive_auth_response(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: dns.name.Name) -> bool:
+    async def retreive_auth_response(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: DnsName) -> bool:
         success = True
         if not await self.get_soa_into(soa_set, ns_addr, ns_name):
             success = False
@@ -824,7 +1233,7 @@ class CheckNameContext:
     async def retreive_auth_responses(self) -> None:
         count_success = 0
 
-        async def handle(ns_addr: IPAddress, ns_name: dns.name.Name) -> None:
+        async def handle(ns_addr: IPAddress, ns_name: DnsName) -> None:
             nonlocal count_success
             if await self.retreive_auth_response(self.auth_soas, ns_addr, ns_name):
                 count_success += 1
@@ -838,7 +1247,7 @@ class CheckNameContext:
         if 2 * count_success < len(self.auths):
             self.ir.error(f'Too many authoritative nameserver down (see log)')
 
-    async def check_hidden_primary(self, hm: dns.name.Name) -> None:
+    async def check_hidden_primary(self, hm: DnsName) -> None:
         assert self.main_soa
         hm_soas: SoaSets = SoaSets()
 
@@ -883,7 +1292,7 @@ class CheckNameContext:
             # no need to print name for sources - there is only a single hidden primary
             sources_str = ' '.join(map(str, sources))
             if self.main_soa != soa:
-                if self.main_soa == soa.replace(serial=self.main_soa.serial):
+                if self.main_soa == dataclasses.replace(soa, serial=self.main_soa.serial):
                     self.ir.warn(f"Hidden primary SOA from {sources_str} serial mismatch for {self.name}")
                     self.ir.log(f"Main authoritative SOA: {self.main_soa}")
                     self.ir.log(f"Hidden primary SOA from {sources_str}: {soa}")
@@ -906,34 +1315,34 @@ class CheckNameContext:
         if self.opts.private:
             return True
         private_entries = {
-            dns.name.from_text(part.strip())
+            DnsName(part.strip())
             for entry in (self.opts.private_entry or [])
             for part in entry.split(',')
         }
         if self.name in private_entries:
             return True
         if self.opts.private_reverse:
-            if self.name == dns.name.root:
+            if self.name.is_root():
                 return False
             # simply cases in self._DIRECT_PRIVATE_ADDRESS_ZONES, but shouldn't be too many
             for z in self._DIRECT_PRIVATE_ADDRESS_ZONES:
-                if self.name == dns.name.from_text(z):
+                if self.name == DnsName(z):
                     return True
             parent = self.name.parent()
-            if parent == dns.name.from_text('172.in-addr.arpa'):
+            if parent == DnsName('172.in-addr.arpa'):
                 # 172.16.0.0/12: 172.16 - 172.31
                 if self.name.labels[0] in (f'{i}'.encode('ascii') for i in range(16, 32)):
                     return True
-            elif parent == dns.name.from_text('100.in-addr.arpa'):
+            elif parent == DnsName('100.in-addr.arpa'):
                 # 100.64.0.0/10, 100.64 - 100.127
                 if self.name.labels[0] in (f'{i}'.encode('ascii') for i in range(64, 128)):
                     return True
         return False
 
-    async def get_private_zone_auths(self) -> dict[dns.name.Name, set[IPAddress]]:
-        result: dict[dns.name.Name, set[IPAddress]] = {}
+    async def get_private_zone_auths(self) -> dict[DnsName, set[IPAddress]]:
+        result: dict[DnsName, set[IPAddress]] = {}
 
-        async def get_ns_addr(ns: dns.name.Name) -> None:
+        async def get_ns_addr(ns: DnsName) -> None:
             try:
                 result[ns] = set(await self.resolver.addresses(ns))
             except dns.exception.DNSException as e:
@@ -979,7 +1388,7 @@ class CheckNameContext:
             self.ir.error("Can't continue without authoritative nameservers to query")
             return
 
-        delegated_auths: set[dns.name.Name] = set(self.auths_by_name)
+        delegated_auths: set[DnsName] = set(self.auths_by_name)
 
         if self.host and not self.host in delegated_auths:
             # add explicit host to NS
@@ -1058,7 +1467,7 @@ class CheckNameContext:
                         self.ir.log(line)
 
         expect_auths = [
-            dns.name.from_text(auth.strip().lower())
+            DnsName(auth.strip().lower())
             for opt in (self.opts.expect_auth or [])
             for auth in opt.split(',')
         ]
