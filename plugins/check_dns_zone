@@ -554,6 +554,10 @@ class Origin:
     def __ge__(self, other: typing.Self) -> bool:
         return self._cmp_tuple() >= other._cmp_tuple()
 
+    @staticmethod
+    def from_resolver_address(address: IPAddress) -> Origin:
+        return Origin(name=DnsName("system-resolver."), address=address)
+
 
 class OriginSet:
     __slots__ = (
@@ -850,7 +854,7 @@ class DnsLookup:
         nameserver = resolver.nameservers[0]
         assert isinstance(nameserver, str), f"First nameserver must be a string containing an IP, got {nameserver!r}"
         address = ipaddress.ip_address(nameserver)
-        return Origin(name=DnsName("system-resolver."), address=address)
+        return Origin.from_resolver_address(address)
 
     @staticmethod
     def _extract_answer(query: dns.message.Message, response: dns.message.Message) -> dns.rrset.RRset | None:
@@ -1032,11 +1036,14 @@ class DnsLookupServersCache:
 
 
 class CheckNameContext:
-    def __init__(self, ir: IcingaResult, opts: argparse.Namespace) -> None:
+    def __init__(self, ir: IcingaResult, opts: Options) -> None:
         self.ir = ir
         self.opts = opts
         self.name = DnsName(opts.zone)
-        self.resolver = DnsLookup(server=opts.resolver)
+        resolver: Origin | None = None
+        if opts.resolver:
+            resolver = Origin.from_resolver_address(ipaddress.ip_address(opts.resolver))
+        self.resolver = DnsLookup(server=resolver)
         self.lookup_servers = DnsLookupServersCache(tcp_only=opts.auth_tcp)
         self.host = DnsName(opts.host) if opts.host else None
 
@@ -1619,8 +1626,22 @@ class CheckNameContext:
                 self.ir.log('+ Checked SOA records via UDP + TCP')
 
 
-def main():
-    try:
+@dataclasses.dataclass(slots=True, kw_only=True)
+class Options:
+    zone: str
+    skip_hidden_primary: bool
+    auth_tcp: bool
+    debug: bool
+    expect_auth: list[str] | None
+    private: bool
+    private_reverse: bool
+    private_entry: list[str] | None
+    resolver: str
+    host: str
+    host_udp: bool
+
+    @staticmethod
+    def parse() -> Options:
         p = argparse.ArgumentParser(description="Check DNS zone (delegation, SOA, DNSSEC) on all authoritatives and hidden primary")
         p.add_argument('zone', help='Name of DNS zone to check')
         p.add_argument('--skip-hidden-primary', '--skip-hidden-master', action='store_true', help="Don't verify hidden primary data (might be blocked by a firewall)")
@@ -1634,6 +1655,12 @@ def main():
         p.add_argument('--host', action='store', help="Make sure zone is hosted on given host")
         p.add_argument('--host-udp', action='store_true', help="Check SOA via UDP too (when --auth-tcp is used) for nameserver given via --host")
         opts = p.parse_args()
+        return Options(**opts.__dict__)
+
+
+def main():
+    try:
+        opts = Options.parse()
         ir = IcingaResult(debug=opts.debug)
         trio.run(CheckNameContext(ir, opts).check)
     except Exception as e:
