@@ -29,6 +29,7 @@ import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.resolver
 import dns.rrset
+import functools
 import ipaddress
 import sys
 import trio
@@ -530,9 +531,158 @@ class DSDelegation:
         return True
 
 
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class Origin:
+    name: DnsName
+    address: IPAddress
+
+    def __str__(self) -> str:
+        return f"{self.address}({self.name})"
+
+    def _cmp_tuple(self) -> tuple[typing.Any, ...]:
+        return (self.name, self.address.version, self.address)
+
+    def __lt__(self, other: typing.Self) -> bool:
+        return self._cmp_tuple() < other._cmp_tuple()
+
+    def __le__(self, other: typing.Self) -> bool:
+        return self._cmp_tuple() <= other._cmp_tuple()
+
+    def __gt__(self, other: typing.Self) -> bool:
+        return self._cmp_tuple() > other._cmp_tuple()
+
+    def __ge__(self, other: typing.Self) -> bool:
+        return self._cmp_tuple() >= other._cmp_tuple()
+
+
+class OriginSet:
+    __slots__ = (
+        "_origins",
+        "_origins_by_name",
+        "_origins_by_address",
+        "_sorted",
+        "_names",
+        "_addresses",
+    )
+
+    def __init__(self, *origins: Origin) -> None:
+        self._origins: set[Origin] = set()
+        self._origins_by_name: dict[DnsName, list[Origin]] = {}
+        self._origins_by_address: dict[IPAddress, list[Origin]] = {}
+        self._sorted: tuple[Origin, ...] | None = None
+        self._names: tuple[DnsName, ...] | None = None
+        self._addresses: tuple[IPAddress, ...] | None = None
+        for origin in origins:
+            self.add(origin)
+
+    def _insert(self, origin: Origin) -> None:
+        self._sorted = None
+        self._names = None
+        self._addresses = None
+        self._origins.add(origin)
+        self._origins_by_name.setdefault(origin.name, []).append(origin)
+        self._origins_by_address.setdefault(origin.address, []).append(origin)
+
+    def add(self, origin: Origin) -> None:
+        if not origin in self._origins:
+            self._insert(origin)
+
+    def add_unique_address(self, origin: Origin) -> Origin | None:
+        """
+        Returns (first) conflicting origin or inserts given origin
+
+        * if origin is already in the set: returns None
+        * if address is already in the set: return first origin with that address
+        * otherwise: insert origin
+        """
+        if origin in self._origins:
+            return None
+        ex_origins = self._origins_by_address.get(origin.address)
+        if ex_origins:
+            return ex_origins[0]
+        self._insert(origin)
+        return None
+
+    def __str__(self) -> str:
+        origins = self.origins
+        if not origins:
+            return "<no origins>"
+        return ", ".join(str(origin) for origin in origins)
+
+    @property
+    def origins(self) -> typing.Sequence[Origin]:
+        origins = self._sorted
+        if origins is None:
+            self._sorted = origins = tuple(sorted(self._origins))
+        return origins
+
+    @property
+    def names(self) -> typing.Sequence[DnsName]:
+        names = self._names
+        if names is None:
+            self._names = names = tuple(sorted(self._origins_by_name))
+        return names
+
+    def names_count(self) -> int:
+        return len(self._origins_by_name)
+
+    def names_set(self) -> set[DnsName]:
+        return set(self._origins_by_name)
+
+    @property
+    def addresses(self) -> typing.Sequence[IPAddress]:
+        addresses = self._addresses
+        if addresses is None:
+            self._addresses = addresses = tuple(sorted(self._origins_by_address, key=lambda a: (a.version, a)))
+        return addresses
+
+    def addresses_count(self) -> int:
+        return len(self._origins_by_address)
+
+    def addresses_set(self) -> set[IPAddress]:
+        return set(self._origins_by_address)
+
+    def __iter__(self) -> typing.Iterator[Origin]:
+        return iter(self.origins)
+
+    @typing.overload
+    def __getitem__(self, address: IPAddress, /) -> typing.Sequence[Origin]: ...
+
+    @typing.overload
+    def __getitem__(self, name: DnsName, /) -> typing.Sequence[Origin]: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            return tuple(self._origins_by_address[index])
+        if isinstance(index, DnsName):
+            return tuple(self._origins_by_name[index])
+        raise KeyError(f"Invalid type of index {type(index)}")
+
+    @typing.overload
+    def __contains__(self, origin: Origin, /) -> bool: ...
+
+    @typing.overload
+    def __contains__(self, address: IPAddress, /) -> bool: ...
+
+    @typing.overload
+    def __contains__(self, name: DnsName, /) -> bool: ...
+
+    def __contains__(self, elem, /) -> bool:
+        if isinstance(elem, Origin):
+            return elem in self._origins
+        if isinstance(elem, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            return elem in self._origins_by_address
+        if isinstance(elem, DnsName):
+            return elem in self._origins_by_name
+        raise ValueError(f"Invalid type of elem: {type(elem)}")
+
+    def __len__(self) -> int:
+        return len(self._origins)
+
+
 @dataclasses.dataclass(slots=True, kw_only=True)
 class DnsTransaction:
-    server: IPAddress
+    server: Origin
     query: dns.message.QueryMessage
     response: dns.message.Message
     used_tcp: bool
@@ -550,7 +700,7 @@ class DnsMessageError(dns.exception.DNSException):
 
 
 class DnsTimeoutError(dns.exception.DNSException):
-    def __init__(self, query: dns.message.Message, server: IPAddress) -> None:
+    def __init__(self, query: dns.message.Message, server: Origin) -> None:
         self.query = query
         self.server = server
 
@@ -561,7 +711,7 @@ class DnsTimeoutError(dns.exception.DNSException):
 
 class DnsConnectionClosedError(dns.exception.DNSException):
     # created from various "server didn't like us" errors (closed through various means)
-    def __init__(self, query: dns.message.Message, server: IPAddress, error: Exception) -> None:
+    def __init__(self, query: dns.message.Message, server: Origin, error: Exception) -> None:
         self.query = query
         self.server = server
         self.error = error
@@ -572,7 +722,7 @@ class DnsConnectionClosedError(dns.exception.DNSException):
 
 
 class DnsOsError(dns.exception.DNSException):
-    def __init__(self, query: dns.message.Message, server: IPAddress, error: OSError) -> None:
+    def __init__(self, query: dns.message.Message, server: Origin, error: OSError) -> None:
         self.query = query
         self.server = server
         self.error = error
@@ -616,14 +766,14 @@ class Delegation:
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class SoaSets:
-    soa_sets: dict[RRDataSOA, set[IPAddress]] = dataclasses.field(default_factory=dict)
+    soa_sets: dict[RRDataSOA, OriginSet] = dataclasses.field(default_factory=dict)
     serials: set[int] = dataclasses.field(default_factory=set)
     mnames: set[DnsName] = dataclasses.field(default_factory=set)
     _min_soas: set[RRDataSOA_stripped] = dataclasses.field(default_factory=set)
 
-    def insert(self, soa: RRDataSOA, address: IPAddress) -> None:
+    def insert(self, soa: RRDataSOA, origin: Origin) -> None:
         # remember full SOAs
-        self.soa_sets.setdefault(soa, set()).add(address)
+        self.soa_sets.setdefault(soa, OriginSet()).add(origin)
         # remember serials and mnames
         self.serials.add(soa.serial)
         self.mnames.add(soa.mname)
@@ -695,11 +845,12 @@ async def retry_action(
 
 class DnsLookup:
     @staticmethod
-    def _get_first_system_resolver() -> IPAddress:
+    def _get_first_system_resolver() -> Origin:
         resolver = dns.resolver.get_default_resolver()
         nameserver = resolver.nameservers[0]
         assert isinstance(nameserver, str), f"First nameserver must be a string containing an IP, got {nameserver!r}"
-        return ipaddress.ip_address(nameserver)
+        address = ipaddress.ip_address(nameserver)
+        return Origin(name=DnsName("system-resolver."), address=address)
 
     @staticmethod
     def _extract_answer(query: dns.message.Message, response: dns.message.Message) -> dns.rrset.RRset | None:
@@ -718,20 +869,20 @@ class DnsLookup:
         cname_entry: dns.rdtypes.ANY.CNAME.CNAME = cname_rr[0]
         return response.get_rrset(dns.message.ANSWER, cname_entry.target, q_rr.rdclass, q_rr.rdtype)
 
-    def __init__(self, *, server: IPAddress | None = None, tcp_only: bool = False) -> None:
+    def __init__(self, *, server: Origin | None = None, tcp_only: bool = False) -> None:
         if server is None:
             server = DnsLookup._get_first_system_resolver()
         self._tcp_only = tcp_only
         self._server = server
-        self._server_str = str(server)
+        self._address_str = str(server.address)
 
     async def _single_query(self, query: dns.message.Message) -> tuple[dns.message.Message, bool]:
         response: dns.message.Message
         if self._tcp_only:
             used_tcp = True
-            response = await dns.asyncquery.tcp(query, self._server_str)
+            response = await dns.asyncquery.tcp(query, self._address_str)
         else:
-            (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._server_str)
+            (response, used_tcp) = await dns.asyncquery.udp_with_fallback(query, self._address_str)
         return (response, used_tcp)
 
     async def _untyped_query(self, query: dns.message.QueryMessage) -> tuple[dns.rrset.RRset | None, DnsTransaction]:
@@ -867,16 +1018,16 @@ class DnsLookup:
 
 class DnsLookupServersCache:
     def __init__(self, *, tcp_only: bool=False):
-        self._servers: dict[tuple[IPAddress, bool], DnsLookup] = {}
+        self._servers: dict[tuple[Origin, bool], DnsLookup] = {}
         self._tcp_only = tcp_only
 
-    def get(self, address: IPAddress, *, tcp_only: bool | tuple[()] = ()) -> DnsLookup:
+    def get(self, origin: Origin, *, tcp_only: bool | tuple[()] = ()) -> DnsLookup:
         if isinstance(tcp_only, tuple):
             tcp_only = self._tcp_only
-        l = self._servers.get((address, tcp_only), None)
+        l = self._servers.get((origin, tcp_only), None)
         if not l:
-            l = DnsLookup(server=address, tcp_only=tcp_only)
-            self._servers[(address, tcp_only)] = l
+            l = DnsLookup(server=origin, tcp_only=tcp_only)
+            self._servers[(origin, tcp_only)] = l
         return l
 
 
@@ -891,21 +1042,16 @@ class CheckNameContext:
 
         #### Values we fill during lookup ####
 
-        # List of all NS names for parent zone
-        # Filled in `retrieve_parent_addresses`
-        self.parent_ns_set: set[DnsName] = set()
-
-        # IP addresses of the authoritative nameservers for the parent zone,
-        # and for each address the name it was resolved from.
+        # Origins (names + IP) for authoritative nameservers for the parent zone.
         # If multiple names resolve to the same address, only a single (random) name is selected.
         # Filled in `retrieve_parent_addresses`
-        self.parent_addresses: dict[IPAddress, DnsName] = {}
+        self.parents = OriginSet()
 
         # Delegations and DS sets in dictionaries where the key represents values that
-        # were found mapping to a list of IPs the values were received from.
+        # were found mapping to a list of origins the values were received from.
         # Filled in `retreive_delegations`
-        self.parent_delegations: dict[Delegation, list[IPAddress]] = {}
-        self.parent_ds_sets: dict[DSDelegation, list[IPAddress]] = {}
+        self.parent_delegations: dict[Delegation, OriginSet] = {}
+        self.parent_ds_sets: dict[DSDelegation, OriginSet] = {}
 
         # if parent_delegations has exactly one entry, this is its key
         # Set in `check_delegations`
@@ -913,24 +1059,16 @@ class CheckNameContext:
 
         # Similar to `parent_delegations`, but results from authoritatives
         # Filled in `retreive_auth_responses`
-        self.auth_delegations: dict[Delegation, set[IPAddress]] = {}
+        self.auth_delegations: dict[Delegation, OriginSet] = {}
         self.auth_soas = SoaSets()
 
         # if `auth_soas` has single entry (ignoring serial and mname)
         # set in main `check`
         self.main_soa: RRDataSOA | None = None
 
-        # `auths` similar to `parent_addresses` - only a single (random) name select per IP
+        # `auths` similar to `parents` - only a single (random) name select per IP
         # set in main `check`
-        self.auths_by_name: dict[DnsName, set[IPAddress]] = {}
-        self.auths: dict[IPAddress, DnsName] = {}
-
-    @staticmethod
-    def sources_names(sources: typing.Iterable[IPAddress], names: dict[IPAddress, typing.Any]) -> str:
-        return ', '.join(
-            f'{source} ({names[source]})'
-            for source in sources
-        )
+        self.auths: OriginSet = OriginSet()
 
     async def retrieve_parent_addresses(self) -> None:
         try:
@@ -949,17 +1087,11 @@ class CheckNameContext:
                 self.ir.error(f'Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_rrset.name} of {self.name}')
                 self.ir.error(str(e))
                 return
-            owns_an_address = False
             for addr in addresses:
-                if addr in self.parent_addresses:
-                    self.ir.log(f'IP {addr} duplicate in NS set for {parent_ns_rrset.name} (known as {self.parent_addresses[addr]} and {parent_ns})')
-                else:
-                    owns_an_address = True
-                    self.parent_addresses[addr] = parent_ns
-            # don't add to `self.parent_ns_set` if it only contains duplicate IPs
-            if owns_an_address:
-                self.parent_ns_set.add(parent_ns)
-            else:
+                ex_origin = self.parents.add_unique_address(Origin(name=parent_ns, address=addr))
+                if ex_origin:
+                    self.ir.log(f'IP {addr} duplicate in NS set for {parent_ns_rrset.name} (known as {ex_origin.name} and {parent_ns})')
+            if not parent_ns in self.parents:
                 self.ir.log(f'NS {parent_ns} for parent zone has no unique IPs, removing it from further consideration')
 
         async with trio.open_nursery() as nursery:
@@ -968,46 +1100,43 @@ class CheckNameContext:
 
     async def retreive_delegations(self) -> None:
         reachable_auths: set[DnsName] = set()
-        auth_ips_down: set[IPAddress] = set()
 
-        async def get_delegation(ns_addr: IPAddress, ns_name: DnsName):
-            r = self.lookup_servers.get(ns_addr)
+        async def get_delegation(ns_origin: Origin) -> None:
+            r = self.lookup_servers.get(ns_origin)
             try:
                 delegation = await r.delegation(self.name)
             except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
                 # assume other "OS" error indicate some kind of unreachability
-                auth_ips_down.add(ns_addr)
-                self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_origin}')
                 return
             except dns.exception.DNSException as e:
-                self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_origin}')
                 self.ir.error(str(e))
                 return
             if delegation is None:
-                self.ir.error(f'Missing delegation (NS) to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(f'Missing delegation (NS) to {self.name} from {ns_origin}')
                 return
-            self.parent_delegations.setdefault(delegation, []).append(ns_addr)
+            self.parent_delegations.setdefault(delegation, OriginSet()).add(ns_origin)
             try:
                 ds = await r.ds(self.name)
             except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
                 # assume other "OS" error indicate some kind of unreachability
-                auth_ips_down.add(ns_addr)
-                self.ir.log(f'Failed to get (dnssec) (DS) to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.log(f'Failed to get (dnssec) (DS) to {self.name} from {ns_origin}')
                 return
             except dns.exception.DNSException as e:
-                self.ir.error(f'Failed to get (dnssec) DS to {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(f'Failed to get (dnssec) DS to {self.name} from {ns_origin}')
                 self.ir.error(str(e))
                 return
             if not ds is None:
                 ds_deleg = DSDelegation(name=self.name, ds_set=frozenset(ds))
-                self.parent_ds_sets.setdefault(ds_deleg, []).append(ns_addr)
-            reachable_auths.add(ns_name)
+                self.parent_ds_sets.setdefault(ds_deleg, OriginSet()).add(ns_origin)
+            reachable_auths.add(ns_origin.name)
 
         async with trio.open_nursery() as nursery:
-            for ns_addr, ns_name in self.parent_addresses.items():
-                nursery.start_soon(get_delegation, ns_addr, ns_name)
+            for ns_origin in self.parents:
+                nursery.start_soon(get_delegation, ns_origin)
 
-        parent_auths_down = self.parent_ns_set - reachable_auths
+        parent_auths_down = self.parents.names_set() - reachable_auths
 
         if len(reachable_auths) == 0:
             self.ir.error(f"No parent authoritatives reachable")
@@ -1021,10 +1150,10 @@ class CheckNameContext:
         #   (although if NS have overlapping IPs this is a "simplified" measurement)
 
         # IP address heuristic: half the IPs should be reachable
-        if 2 * len(auth_ips_down) > len(self.parent_addresses):
-            self.ir.warn(f"Too many parent authoritative IPs unreachable: {self.sources_names(auth_ips_down, self.parent_addresses)}")
+        if 2 * len(auth_ips_down) > len(self.parents):
+            self.ir.warn(f"Too many parent authoritative IPs unreachable: {auth_ips_down}")
         # NS heuristic: half of the NS should be reachable
-        elif 2 * len(parent_auths_down) > len(self.parent_ns_set):
+        elif 2 * len(parent_auths_down) > self.parents.names_count():
             self.ir.warn(f"Too many parent authoritatives unreachable: {' '.join(map(str, parent_auths_down))}")
         elif parent_auths_down:
             self.ir.log(f"Some parent authoritatives are unreachable: {' '.join(map(str, parent_auths_down))}")
@@ -1036,7 +1165,7 @@ class CheckNameContext:
 
         logged_delegation: set[Delegation] = set()
 
-        for delegation, sources in self.parent_delegations.items():
+        for delegation, origins in self.parent_delegations.items():
             missing_glue: set[DnsName] = set()
             for ns, addrs in delegation.nameservers_tuple:
                 if not addrs:
@@ -1044,7 +1173,7 @@ class CheckNameContext:
                         missing_glue.add(ns)
             if missing_glue:
                 logged_delegation.add(delegation)
-                self.ir.log(f'Delegation from {self.sources_names(sources, self.parent_addresses)}:')
+                self.ir.log(f'Delegation from {origins}:')
                 for line in delegation.to_lines():
                     self.ir.log(line)
                 self.ir.error(f"Delegation missing glue for {' '.join(map(str, missing_glue))}")
@@ -1055,11 +1184,11 @@ class CheckNameContext:
             self.main_delegation = list(self.parent_delegations.keys())[0]
 
         if len(self.parent_delegations) != 1 or self.ir._debug:
-            for delegation, sources in self.parent_delegations.items():
+            for delegation, origins in self.parent_delegations.items():
                 if delegation in logged_delegation:
                     # don't log twice
                     continue
-                self.ir.log(f'Delegation from {self.sources_names(sources, self.parent_addresses)}:')
+                self.ir.log(f'Delegation from {origins}:')
                 for line in delegation.to_lines():
                     self.ir.log(line)
 
@@ -1068,8 +1197,8 @@ class CheckNameContext:
         elif len(self.parent_ds_sets) > 1:
             self.ir.warn(f'Different DS record sets to {self.name}')
         if len(self.parent_ds_sets) > 1 or self.ir._debug:
-            for dsdeleg, sources in self.parent_ds_sets.items():
-                self.ir.log(f'DS set from {self.sources_names(sources, self.parent_addresses)}:')
+            for dsdeleg, origins in self.parent_ds_sets.items():
+                self.ir.log(f'DS set from {origins}:')
                 for ds in dsdeleg.ds_set:
                     self.ir.log(f'* {ds}')
 
@@ -1115,134 +1244,133 @@ class CheckNameContext:
     def transpose_delegation_auths(
         self,
         auths: dict[DnsName, set[IPAddress]],
-    ) -> dict[IPAddress, DnsName]:
-        result: dict[IPAddress, DnsName] = {}
+    ) -> OriginSet:
+        result = OriginSet()
         for ns_name, addrs in auths.items():
             for addr in addrs:
-                if addr in result:
-                    self.ir.log(f'IP {addr} duplicate in NS set for {self.name} (known as {result[addr]} and {ns_name})')
-                else:
-                    result[addr] = ns_name
+                ex_origin = result.add_unique_address(Origin(name=ns_name, address=addr))
+                if ex_origin:
+                    self.ir.log(f'IP {addr} duplicate in NS set for {self.name} (known as {ex_origin.name} and {ns_name})')
         return result
 
-    async def check_dnskey(self, ns_addr: IPAddress, ns_name: DnsName) -> bool:
-        l = self.lookup_servers.get(ns_addr)
+    async def check_dnskey(self, ns_origin: Origin) -> bool:
+        l = self.lookup_servers.get(ns_origin)
         try:
             dnskey_set, tx = await l.dnskey(self.name)
         except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
-            self.ir.log(f'Failed to get DNSKEY for {self.name} from {ns_addr} ({ns_name})')
+            self.ir.log(f'Failed to get DNSKEY for {self.name} from {ns_origin}')
             self.ir.log(str(sys.exception()))
             return False
         except dns.exception.DNSException as e:
-            self.ir.error(f'Failed to get DNSKEY for {self.name} from {ns_addr} ({ns_name})')
+            self.ir.error(f'Failed to get DNSKEY for {self.name} from {ns_origin}')
             self.ir.error(str(e))
             return False
         if not dnskey_set:
-            self.ir.error(f'Missing DNSKEY for {self.name} from {ns_addr} ({ns_name}) - but delegation is secured by DS')
+            self.ir.error(f'Missing DNSKEY for {self.name} from {ns_origin} - but delegation is secured by DS')
             return False
         if not dnskey_set.rrsig:
-            self.ir.error(f'DNSKEY for {self.name} not signed from {ns_addr} ({ns_name})')
+            self.ir.error(f'DNSKEY for {self.name} not signed from {ns_origin}')
             return False
         for dsdeleg, parents in self.parent_ds_sets.items():
             if dsdeleg.validate_zone_keys(dnskey_set):
-                self.ir.debug(f'DNSKEY good for {self.name} from {ns_addr} ({ns_name}) from DS from {parents}')
+                self.ir.debug(f'DNSKEY good for {self.name} from {ns_origin} from DS from {parents}')
             else:
-                self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_addr} ({ns_name}) from DS from {parents}')
+                self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_origin} from DS from {parents}')
                 return False
         return True
 
-    async def retrieve_auth_delegation(self, ns_addr: IPAddress, ns_name: DnsName) -> bool:
-        l = self.lookup_servers.get(ns_addr)
+    async def retrieve_auth_delegation(self, ns_origin: Origin) -> bool:
+        l = self.lookup_servers.get(ns_origin)
         try:
             delegation = await l.delegation(self.name)
         except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
-            self.ir.log(f'Failed to get delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
+            self.ir.log(f'Failed to get delegation (NS) to {self.name} from authoritative {ns_origin}')
             self.ir.log(str(sys.exception()))
             return False
         except dns.exception.DNSException as e:
-            self.ir.error(f'Failed to get delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
+            self.ir.error(f'Failed to get delegation (NS) to {self.name} from authoritative {ns_origin}')
             self.ir.error(str(e))
             return False
         if delegation:
-            self.auth_delegations.setdefault(delegation, set()).add(ns_addr)
+            self.auth_delegations.setdefault(delegation, OriginSet()).add(ns_origin)
             return True
         else:
-            self.ir.error(f'Got no delegation (NS) to {self.name} from authoritative {ns_addr} ({ns_name})')
+            self.ir.error(f'Got no delegation (NS) to {self.name} from authoritative {ns_origin}')
             return False
 
-    async def get_soa_into(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: DnsName) -> bool:
-        l = self.lookup_servers.get(ns_addr)
+    async def get_soa_into(self, soa_set: SoaSets, ns_origin: Origin) -> bool:
+        l = self.lookup_servers.get(ns_origin)
         try:
             soa = await l.soa(self.name)
         except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
-            self.ir.log(f'Failed to get SOA for {self.name} from {ns_addr} ({ns_name})')
+            self.ir.log(f'Failed to get SOA for {self.name} from {ns_origin}')
             self.ir.log(str(sys.exception()))
             return False
         except dns.exception.DNSException as e:
-            self.ir.error(f'Failed to get SOA for {self.name} from {ns_addr} ({ns_name})')
+            self.ir.error(f'Failed to get SOA for {self.name} from {ns_origin}')
             self.ir.error(str(e))
             return False
 
         if soa:
-            soa_set.insert(soa.data, ns_addr)
+            soa_set.insert(soa.data, ns_origin)
         else:
-            self.ir.error(f'Got no SOA for {self.name} from {ns_addr} ({ns_name})')
+            self.ir.error(f'Got no SOA for {self.name} from {ns_origin}')
             return False
 
         other_l: DnsLookup | None = None
         other_msg = ""
         if self.opts.auth_tcp:
-            if self.opts.host_udp and self.host == ns_name:
-                other_l = self.lookup_servers.get(ns_addr, tcp_only=False)
+            if self.opts.host_udp and self.host == ns_origin.name:
+                other_l = self.lookup_servers.get(ns_origin, tcp_only=False)
                 other_msg = "via UDP (after successful TCP)"
         else:
-            other_l = self.lookup_servers.get(ns_addr, tcp_only=True)
+            other_l = self.lookup_servers.get(ns_origin, tcp_only=True)
             other_msg = "via TCP (after successful UDP)"
 
         if other_l:
             try:
                 other_soa = await other_l.soa(self.name)
             except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
-                self.ir.log(f'Failed to get SOA {other_msg} for {self.name} from {ns_addr} ({ns_name})')
+                self.ir.log(f'Failed to get SOA {other_msg} for {self.name} from {ns_origin}')
                 self.ir.log(str(sys.exception()))
                 return False
             except dns.exception.DNSException as e:
-                self.ir.error(f'Failed to get SOA {other_msg} for {self.name} from {ns_addr} ({ns_name})')
+                self.ir.error(f'Failed to get SOA {other_msg} for {self.name} from {ns_origin}')
                 self.ir.error(str(e))
                 return False
             if other_soa != soa:
                 self.ir.error(f"Got different SOA {other_msg}")
                 self.ir.error(f"{other_soa} != {soa}")
                 return False
-            self.ir.debug(f"Successful SOA {other_msg} from {ns_addr} ({ns_name})")
+            self.ir.debug(f"Successful SOA {other_msg} from {ns_origin}")
 
         return True
 
 
-    async def retreive_auth_response(self, soa_set: SoaSets, ns_addr: IPAddress, ns_name: DnsName) -> bool:
+    async def retreive_auth_response(self, soa_set: SoaSets, ns_origin: Origin) -> bool:
         success = True
-        if not await self.get_soa_into(soa_set, ns_addr, ns_name):
+        if not await self.get_soa_into(soa_set, ns_origin):
             success = False
-        if not await self.retrieve_auth_delegation(ns_addr, ns_name):
+        if not await self.retrieve_auth_delegation(ns_origin):
             success = False
         if self.parent_ds_sets:
-            if not await self.check_dnskey(ns_addr, ns_name):
+            if not await self.check_dnskey(ns_origin):
                 success = False
         return success
 
     async def retreive_auth_responses(self) -> None:
         count_success = 0
 
-        async def handle(ns_addr: IPAddress, ns_name: DnsName) -> None:
+        async def handle(ns_origin: Origin) -> None:
             nonlocal count_success
-            if await self.retreive_auth_response(self.auth_soas, ns_addr, ns_name):
+            if await self.retreive_auth_response(self.auth_soas, ns_origin):
                 count_success += 1
-            elif ns_name == self.host:
+            elif ns_origin.name == self.host:
                 self.ir.error(f'Required authoritative nameserver {self.host} failed to respond (see log)')
 
         async with trio.open_nursery() as nursery:
-            for ns_addr, ns_name in self.auths.items():
-                nursery.start_soon(handle, ns_addr, ns_name)
+            for ns_origin in self.auths:
+                nursery.start_soon(handle, ns_origin)
 
         if 2 * count_success < len(self.auths):
             self.ir.error(f'Too many authoritative nameserver down (see log)')
@@ -1255,7 +1383,7 @@ class CheckNameContext:
 
         async def handle(ns_addr: IPAddress) -> None:
             nonlocal count_success
-            if await self.retreive_auth_response(hm_soas, ns_addr, hm):
+            if await self.retreive_auth_response(hm_soas, Origin(name=hm, address=ns_addr)):
                 count_success += 1
 
         count_hm_queries = 0
@@ -1268,11 +1396,11 @@ class CheckNameContext:
             return
         async with trio.open_nursery() as nursery:
             for ns_addr in hm_addrs:
-                if ns_addr in self.auths:
-                    self.ir.log(f'IP {ns_addr} of hidden primary {hm} duplicate of NS set for {self.name} (known as {self.auths[ns_addr]})')
+                ex_origin = self.auths.add_unique_address(Origin(name=hm, address=ns_addr))
+                if ex_origin:
+                    self.ir.log(f'IP {ns_addr} of hidden primary {hm} duplicate of NS set for {self.name} (known as {ex_origin.name})')
                     continue
                 count_hm_queries += 1
-                self.auths[ns_addr] = hm
                 nursery.start_soon(handle, ns_addr)
 
         if count_hm_queries == 0:
@@ -1378,28 +1506,28 @@ class CheckNameContext:
             await self.retreive_delegations()
             await self.check_delegations()
 
-            self.auths_by_name = await self.build_merged_delegation()
+            auths_by_name = await self.build_merged_delegation()
         else:
             self.ir.log("Not checking delegation, was marked as private zone entry")
-            self.auths_by_name = await self.get_private_zone_auths()
+            auths_by_name = await self.get_private_zone_auths()
 
-        if len(self.auths_by_name) == 0:
+        if len(auths_by_name) == 0:
             # there should have been an error message about this already
             self.ir.error("Can't continue without authoritative nameservers to query")
             return
 
-        delegated_auths: set[DnsName] = set(self.auths_by_name)
+        delegated_auths: set[DnsName] = set(auths_by_name)
 
         if self.host and not self.host in delegated_auths:
             # add explicit host to NS
             try:
-                self.auths_by_name[self.host] = set(await self.resolver.addresses(self.host))
+                auths_by_name[self.host] = set(await self.resolver.addresses(self.host))
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to lookup addresses for explicit NS-host {self.host} of zone {self.name}')
                 self.ir.error(str(e))
                 return
 
-        self.auths = self.transpose_delegation_auths(self.auths_by_name)
+        self.auths = self.transpose_delegation_auths(auths_by_name)
 
         await self.retreive_auth_responses()
 
@@ -1423,7 +1551,7 @@ class CheckNameContext:
             if not log_soas:
                 self.ir.debug('SOAs from authoritatives:')
             for soa, sources in self.auth_soas.soa_sets.items():
-                self.ir.log(f'From {self.sources_names(sources, self.auths)}:')
+                self.ir.log(f'From {sources}:')
                 self.ir.log(f'  {self.name} SOA {soa}')
 
         if self.main_soa:
@@ -1451,18 +1579,18 @@ class CheckNameContext:
                         self.ir.log('Delegation:')
                         for line in self.main_delegation.to_lines():
                             self.ir.log(line)
-                    self.ir.warn(f'Different delegation data from authoritatives {self.sources_names(sources, self.auths)}:')
+                    self.ir.warn(f'Different delegation data from authoritatives {sources}:')
                     for line in delegation.to_lines():
                         self.ir.log(line)
                 else:
-                    self.ir.debug(f'Delegation matched data from authoritive {self.sources_names(sources, self.auths)}')
+                    self.ir.debug(f'Delegation matched data from authoritive {sources}')
         elif private_zone:
             # Can't compare with delegation from parent(s), so check between auths
             if len(self.auth_delegations) > 1:
                 self.ir.error("Multiple delegations from authoritatives")
             if len(self.auth_delegations) > 1 or self.ir._debug:
                 for delegation, sources in self.auth_delegations.items():
-                    self.ir.log(f'Delegation data from authoritatives {self.sources_names(sources, self.auths)}:')
+                    self.ir.log(f'Delegation data from authoritatives {sources}:')
                     for line in delegation.to_lines():
                         self.ir.log(line)
 
