@@ -1153,8 +1153,8 @@ class DnsLookup:
         assert not aaaa is None, f"get_v6 failed: {aaaa!r}"
         return [*a, *aaaa]
 
-    async def dnskey(self, name: DnsName) -> tuple[RRSet[RRDataDNSKEY] | None, DnsTransaction]:
-        return await self.query(name, RRDataDNSKEY)
+    async def dnskey(self, name: DnsName) -> RRSet[RRDataDNSKEY] | None:
+        return (await self.query(name, RRDataDNSKEY))[0]
 
 
 class DnsLookupServersCache:
@@ -1393,7 +1393,7 @@ class CheckNameContext:
     async def check_dnskey(self, ns_origin: Origin) -> bool:
         l = self.lookup_servers.get(ns_origin)
         try:
-            dnskey_set, tx = await l.dnskey(self.name)
+            dnskey_set = await l.dnskey(self.name)
         except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
             self.ir.log(f'Failed to get DNSKEY for {self.name} from {ns_origin}')
             self.ir.log(str(sys.exception()))
