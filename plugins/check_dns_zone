@@ -613,6 +613,10 @@ class OriginSet:
             return "<no origins>"
         return ", ".join(str(origin) for origin in origins)
 
+    def __sub__(self, other: OriginSet) -> OriginSet:
+        assert isinstance(other, OriginSet)
+        return OriginSet(*(self._origins - other._origins))
+
     @property
     def origins(self) -> typing.Sequence[Origin]:
         origins = self._sorted
@@ -682,6 +686,139 @@ class OriginSet:
 
     def __len__(self) -> int:
         return len(self._origins)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class CheckLimits:
+    critical: float
+    warning: float
+
+    def log_if_gt(self, ir: IcingaResult, value: float, msg: str) -> None:
+        if value > self.critical:
+            ir.error(msg)
+        elif value > self.warning:
+            ir.warn(msg)
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class ResponseOriginCheckLimits:
+    # count by name
+    max_failed_ns: CheckLimits = CheckLimits(critical=2, warning=1)
+    max_failed_ns_pct: CheckLimits = CheckLimits(critical=0.5, warning=0.5)
+    # count per family:
+    max_failed_addresses: CheckLimits = CheckLimits(critical=2, warning=1)
+    max_failed_addresses_pct: CheckLimits = CheckLimits(critical=0.5, warning=0.5)
+    # count by name
+    max_ns_with_failure: CheckLimits = CheckLimits(critical=2, warning=1)
+    max_ns_with_failure_pct: CheckLimits = CheckLimits(critical=0.5, warning=0.5)
+
+
+TResponse = typing.TypeVar("TResponse")
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ResponsesByOrigins(typing.Generic[TResponse]):
+    responses: dict[TResponse, OriginSet] = dataclasses.field(default_factory=dict)
+
+    def add_response(self, origin: Origin, response: TResponse) -> None:
+        self.responses.setdefault(response, OriginSet()).add(origin)
+
+    def single_response(self) -> TResponse | None:
+        """
+        If responses contains exactly one response, return that.
+        """
+        if len(self.responses) == 1:
+            return next(iter(self.responses.keys()))
+        return None
+
+    def __iter__(self) -> typing.Iterator[tuple[TResponse, OriginSet]]:
+        return iter(self.responses.items())
+
+    def __len__(self) -> int:
+        return len(self.responses)
+
+
+@dataclasses.dataclass(slots=True)
+class TrackOriginAvailability:
+    context: str
+    _failed_origins: OriginSet
+    _seen_origins: OriginSet
+
+    def __init__(self, *, context: str) -> None:
+        self.context = context
+        self._failed_origins = OriginSet()
+        self._seen_origins = OriginSet()
+
+    def add_origin(self, origin: Origin) -> None:
+        """
+        Add (expected) origin; if it doesn't fail (before or after this) success is assumed.
+        """
+        self._seen_origins.add(origin)
+
+    def add_failed_origin(self, origin: Origin) -> None:
+        self._failed_origins.add(origin)
+        self._seen_origins.add(origin)
+
+    def num_seen_origins(self) -> int:
+        return len(self._seen_origins)
+
+    def check(self, ir: IcingaResult, policy: ResponseOriginCheckLimits) -> None:
+        # successful origins: seen and never failed
+        success_origins = self._seen_origins - self._failed_origins
+
+        if not success_origins:
+            ir.error(f"{self.context}: All servers failed, tried {self._failed_origins}")
+            return
+
+        # Whether too many NS failed completely
+        seen_ns = self._seen_origins.names_set()
+        seen_ns_success = success_origins.names_set()
+        seen_ns_fail = self._failed_origins.names_set()
+
+        count_ns_no_success = len(seen_ns_fail - seen_ns_success)
+        count_ns_total = len(seen_ns)
+        policy.max_failed_ns.log_if_gt(
+            ir,
+            count_ns_no_success,
+            f"{self.context}: Too many servers didn't respond: {self._failed_origins}",
+        )
+        policy.max_failed_ns_pct.log_if_gt(
+            ir,
+            count_ns_no_success / count_ns_total,
+            f"{self.context}: Too many servers didn't respond: {self._failed_origins}",
+        )
+
+        # Whether too many NS had partial failures (on at least one address)
+        count_ns_with_fails = len(seen_ns_fail)
+        policy.max_ns_with_failure.log_if_gt(
+            ir,
+            count_ns_with_fails,
+            f"{self.context}: Too many servers didn't respond: {self._failed_origins}",
+        )
+        policy.max_ns_with_failure_pct.log_if_gt(
+            ir,
+            count_ns_with_fails / count_ns_total,
+            f"{self.context}: Too many servers didn't respond: {self._failed_origins}",
+        )
+
+        # Whether too many addresses failed
+        failed_addresses = self._failed_origins.addresses
+        all_addresses = self._seen_origins.addresses
+        count_failed_ipv4 = len([a for a in failed_addresses if a.version == 4])
+        count_total_ipv4 = max(len([a for a in all_addresses if a.version == 4]), 1)  # don't divide by 0
+        count_failed_ipv6 = len([a for a in failed_addresses if a.version == 6])
+        count_total_ipv6 = max(len([a for a in all_addresses if a.version == 6]), 1)  # don't divide by 0
+
+        policy.max_failed_addresses.log_if_gt(
+            ir,
+            max(count_failed_ipv4, count_failed_ipv6),
+            f"{self.context}: Too many addresses of a family didn't respond: {self._failed_origins}",
+        )
+        policy.max_failed_addresses_pct.log_if_gt(
+            ir,
+            max(count_failed_ipv4 / count_total_ipv4, count_failed_ipv6 / count_total_ipv6),
+            f"{self.context}: Too many addresses of a family didn't respond: {self._failed_origins}",
+        )
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -1057,8 +1194,8 @@ class CheckNameContext:
         # Delegations and DS sets in dictionaries where the key represents values that
         # were found mapping to a list of origins the values were received from.
         # Filled in `retreive_delegations`
-        self.parent_delegations: dict[Delegation, OriginSet] = {}
-        self.parent_ds_sets: dict[DSDelegation, OriginSet] = {}
+        self.parent_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
+        self.parent_ds_sets: ResponsesByOrigins[DSDelegation] = ResponsesByOrigins()
 
         # if parent_delegations has exactly one entry, this is its key
         # Set in `check_delegations`
@@ -1066,7 +1203,7 @@ class CheckNameContext:
 
         # Similar to `parent_delegations`, but results from authoritatives
         # Filled in `retreive_auth_responses`
-        self.auth_delegations: dict[Delegation, OriginSet] = {}
+        self.auth_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
         self.auth_soas = SoaSets()
 
         # if `auth_soas` has single entry (ignoring serial and mname)
@@ -1106,64 +1243,58 @@ class CheckNameContext:
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
     async def retreive_delegations(self) -> None:
-        reachable_auths: set[DnsName] = set()
+        track_delegation = TrackOriginAvailability(context=f"Delegation (NS+DS) from parent zone")
+        delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
 
-        async def get_delegation(ns_origin: Origin) -> None:
+        async def _get_delegation(ns_origin: Origin) -> bool:
+            track_delegation.add_origin(ns_origin)
             r = self.lookup_servers.get(ns_origin)
             try:
                 delegation = await r.delegation(self.name)
             except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
                 # assume other "OS" error indicate some kind of unreachability
                 self.ir.log(f'Failed to get delegation (NS) to {self.name} from {ns_origin}')
-                return
+                return False
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get delegation (NS) to {self.name} from {ns_origin}')
                 self.ir.error(str(e))
-                return
+                return False
             if delegation is None:
                 self.ir.error(f'Missing delegation (NS) to {self.name} from {ns_origin}')
-                return
-            self.parent_delegations.setdefault(delegation, OriginSet()).add(ns_origin)
+                return False
+            self.parent_delegations.add_response(ns_origin, delegation)
             try:
                 ds = await r.ds(self.name)
             except (DnsTimeoutError, DnsConnectionClosedError, DnsOsError):
                 # assume other "OS" error indicate some kind of unreachability
                 self.ir.log(f'Failed to get (dnssec) (DS) to {self.name} from {ns_origin}')
-                return
+                return False
             except dns.exception.DNSException as e:
                 self.ir.error(f'Failed to get (dnssec) DS to {self.name} from {ns_origin}')
                 self.ir.error(str(e))
-                return
+                return False
+            ds_deleg: DSDelegation | None = None
             if not ds is None:
                 ds_deleg = DSDelegation(name=self.name, ds_set=frozenset(ds))
-                self.parent_ds_sets.setdefault(ds_deleg, OriginSet()).add(ns_origin)
-            reachable_auths.add(ns_origin.name)
+                self.parent_ds_sets.add_response(ns_origin, ds_deleg)
+            return True
+
+        async def get_delegation(ns_origin: Origin) -> None:
+            if await _get_delegation(ns_origin):
+                track_delegation.add_origin(ns_origin)
+            else:
+                track_delegation.add_failed_origin(ns_origin)
 
         async with trio.open_nursery() as nursery:
             for ns_origin in self.parents:
                 nursery.start_soon(get_delegation, ns_origin)
 
-        parent_auths_down = self.parents.names_set() - reachable_auths
+        track_delegation.check(self.ir, ResponseOriginCheckLimits())
 
-        if len(reachable_auths) == 0:
-            self.ir.error(f"No parent authoritatives reachable")
-            return
-        assert self.parent_delegations, "Must have at least one delegation here"
+        if not self.parent_delegations:
+            # there should have been other errors before, but make sure to log this explicitly
+            self.ir.error(f"No delegations from parent zone")
 
-        # TODO: what are proper warning levels?
-        # we have:
-        # * number of unreachable IPs (vs total IPs)
-        # * number of unreachable NS, i.e. unreachable on all their IPs (vs number of NS)
-        #   (although if NS have overlapping IPs this is a "simplified" measurement)
-
-        # IP address heuristic: half the IPs should be reachable
-        if 2 * len(auth_ips_down) > len(self.parents):
-            self.ir.warn(f"Too many parent authoritative IPs unreachable: {auth_ips_down}")
-        # NS heuristic: half of the NS should be reachable
-        elif 2 * len(parent_auths_down) > self.parents.names_count():
-            self.ir.warn(f"Too many parent authoritatives unreachable: {' '.join(map(str, parent_auths_down))}")
-        elif parent_auths_down:
-            self.ir.log(f"Some parent authoritatives are unreachable: {' '.join(map(str, parent_auths_down))}")
 
     async def check_delegations(self) -> None:
         if len(self.parent_delegations) == 0:
@@ -1172,7 +1303,7 @@ class CheckNameContext:
 
         logged_delegation: set[Delegation] = set()
 
-        for delegation, origins in self.parent_delegations.items():
+        for delegation, origins in self.parent_delegations:
             missing_glue: set[DnsName] = set()
             for ns, addrs in delegation.nameservers_tuple:
                 if not addrs:
@@ -1185,13 +1316,12 @@ class CheckNameContext:
                     self.ir.log(line)
                 self.ir.error(f"Delegation missing glue for {' '.join(map(str, missing_glue))}")
 
-        if len(self.parent_delegations) != 1:
+        self.main_delegation = self.parent_delegations.single_response()
+        if not self.main_delegation:
             self.ir.warn(f'Different delegations to {self.name}')
-        else:
-            self.main_delegation = list(self.parent_delegations.keys())[0]
 
-        if len(self.parent_delegations) != 1 or self.ir._debug:
-            for delegation, origins in self.parent_delegations.items():
+        if not self.main_delegation or self.ir._debug:
+            for delegation, origins in self.parent_delegations:
                 if delegation in logged_delegation:
                     # don't log twice
                     continue
@@ -1204,7 +1334,7 @@ class CheckNameContext:
         elif len(self.parent_ds_sets) > 1:
             self.ir.warn(f'Different DS record sets to {self.name}')
         if len(self.parent_ds_sets) > 1 or self.ir._debug:
-            for dsdeleg, origins in self.parent_ds_sets.items():
+            for dsdeleg, origins in self.parent_ds_sets:
                 self.ir.log(f'DS set from {origins}:')
                 for ds in dsdeleg.ds_set:
                     self.ir.log(f'* {ds}')
@@ -1217,7 +1347,7 @@ class CheckNameContext:
         Additionally lookup all names we didn't find addresses in the delegations for (i.e. no glue).
         """
         merged_delegation: dict[DnsName, set[IPAddress]] = {}
-        for delegation in self.parent_delegations:
+        for delegation, _origins in self.parent_delegations:
             for ns, frozen_addrs in delegation.nameservers_tuple:
                 merged_delegation.setdefault(ns, set()).update(frozen_addrs)
 
@@ -1278,7 +1408,7 @@ class CheckNameContext:
         if not dnskey_set.rrsig:
             self.ir.error(f'DNSKEY for {self.name} not signed from {ns_origin}')
             return False
-        for dsdeleg, parents in self.parent_ds_sets.items():
+        for dsdeleg, parents in self.parent_ds_sets:
             if dsdeleg.validate_zone_keys(dnskey_set):
                 self.ir.debug(f'DNSKEY good for {self.name} from {ns_origin} from DS from {parents}')
             else:
@@ -1299,7 +1429,7 @@ class CheckNameContext:
             self.ir.error(str(e))
             return False
         if delegation:
-            self.auth_delegations.setdefault(delegation, OriginSet()).add(ns_origin)
+            self.auth_delegations.add_response(ns_origin, delegation)
             return True
         else:
             self.ir.error(f'Got no delegation (NS) to {self.name} from authoritative {ns_origin}')
@@ -1353,7 +1483,6 @@ class CheckNameContext:
 
         return True
 
-
     async def retreive_auth_response(self, soa_set: SoaSets, ns_origin: Origin) -> bool:
         success = True
         if not await self.get_soa_into(soa_set, ns_origin):
@@ -1366,34 +1495,32 @@ class CheckNameContext:
         return success
 
     async def retreive_auth_responses(self) -> None:
-        count_success = 0
+        track_auth_responses = TrackOriginAvailability(context="Auths")
 
         async def handle(ns_origin: Origin) -> None:
-            nonlocal count_success
             if await self.retreive_auth_response(self.auth_soas, ns_origin):
-                count_success += 1
-            elif ns_origin.name == self.host:
-                self.ir.error(f'Required authoritative nameserver {self.host} failed to respond (see log)')
+                track_auth_responses.add_origin(ns_origin)
+            else:
+                track_auth_responses.add_failed_origin(ns_origin)
+                if ns_origin.name == self.host:
+                    self.ir.error(f'Required authoritative nameserver {self.host} failed to respond (see log)')
 
         async with trio.open_nursery() as nursery:
             for ns_origin in self.auths:
                 nursery.start_soon(handle, ns_origin)
 
-        if 2 * count_success < len(self.auths):
-            self.ir.error(f'Too many authoritative nameserver down (see log)')
+        track_auth_responses.check(self.ir, ResponseOriginCheckLimits())
 
     async def check_hidden_primary(self, hm: DnsName) -> None:
         assert self.main_soa
         hm_soas: SoaSets = SoaSets()
+        track_hm = TrackOriginAvailability(context="Hidden Primary")
 
-        count_success = 0
-
-        async def handle(ns_addr: IPAddress) -> None:
-            nonlocal count_success
-            if await self.retreive_auth_response(hm_soas, Origin(name=hm, address=ns_addr)):
-                count_success += 1
-
-        count_hm_queries = 0
+        async def handle(hm_origin: Origin) -> None:
+            if await self.retreive_auth_response(hm_soas, hm_origin):
+                track_hm.add_origin(hm_origin)
+            else:
+                track_hm.add_failed_origin(hm_origin)
 
         try:
             hm_addrs = await self.resolver.addresses(hm)
@@ -1403,25 +1530,21 @@ class CheckNameContext:
             return
         async with trio.open_nursery() as nursery:
             for ns_addr in hm_addrs:
-                ex_origin = self.auths.add_unique_address(Origin(name=hm, address=ns_addr))
+                hm_origin = Origin(name=hm, address=ns_addr)
+                ex_origin = self.auths.add_unique_address(hm_origin)
                 if ex_origin:
                     self.ir.log(f'IP {ns_addr} of hidden primary {hm} duplicate of NS set for {self.name} (known as {ex_origin.name})')
                     continue
-                count_hm_queries += 1
-                nursery.start_soon(handle, ns_addr)
+                nursery.start_soon(handle, hm_origin)
 
-        if count_hm_queries == 0:
+        if track_hm.num_seen_origins() == 0:
             self.ir.log(f"All addresses of hidden primary {hm} overlap with addresses of NS set")
             return
 
-        if count_success == 0:
-            self.ir.warn(f"Hidden primary {hm} not reachable")
-            return
-
-        if count_success < count_hm_queries:
-            # we also want to know if dual-stack isn't working properly, so
-            # allowing 50% to fail is not helpful.
-            self.ir.warn(f"Not all addresses of hidden primary {hm} are reachable")
+        track_hm.check(self.ir, ResponseOriginCheckLimits(
+            max_failed_addresses=CheckLimits(critical=2, warning=0),
+            max_failed_addresses_pct=CheckLimits(critical=1.0, warning=1.0),
+        ))
 
         for soa, sources in hm_soas.soa_sets.items():
             # no need to print name for sources - there is only a single hidden primary
@@ -1579,7 +1702,7 @@ class CheckNameContext:
         # `check_hidden_primary` must come before this.
         logged_expected_delegation = False
         if self.main_delegation:
-            for delegation, sources in self.auth_delegations.items():
+            for delegation, sources in self.auth_delegations:
                 if self.main_delegation != delegation:
                     if not logged_expected_delegation:
                         logged_expected_delegation = True
@@ -1596,7 +1719,7 @@ class CheckNameContext:
             if len(self.auth_delegations) > 1:
                 self.ir.error("Multiple delegations from authoritatives")
             if len(self.auth_delegations) > 1 or self.ir._debug:
-                for delegation, sources in self.auth_delegations.items():
+                for delegation, sources in self.auth_delegations:
                     self.ir.log(f'Delegation data from authoritatives {sources}:')
                     for line in delegation.to_lines():
                         self.ir.log(line)
