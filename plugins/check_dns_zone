@@ -1204,6 +1204,7 @@ class CheckNameContext:
         # Similar to `parent_delegations`, but results from authoritatives
         # Filled in `retrieve_auth_responses`
         self.auth_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
+        self.auth_dnskeys: ResponsesByOrigins[RRSet[RRDataDNSKEY]] = ResponsesByOrigins()
         self.auth_soas = SoaSets()
 
         # if `auth_soas` has single entry (ignoring serial and mname)
@@ -1390,7 +1391,7 @@ class CheckNameContext:
                     self.ir.log(f'IP {addr} duplicate in NS set for {self.name} (known as {ex_origin.name} and {ns_name})')
         return result
 
-    async def check_dnskey(self, ns_origin: Origin) -> bool:
+    async def retrieve_auth_dnskeys(self, ns_origin: Origin) -> bool:
         l = self.lookup_servers.get(ns_origin)
         try:
             dnskey_set = await l.dnskey(self.name)
@@ -1408,13 +1409,26 @@ class CheckNameContext:
         if not dnskey_set.rrsig:
             self.ir.error(f'DNSKEY for {self.name} not signed from {ns_origin}')
             return False
-        for dsdeleg, parents in self.parent_ds_sets:
-            if dsdeleg.validate_zone_keys(dnskey_set):
-                self.ir.debug(f'DNSKEY good for {self.name} from {ns_origin} from DS from {parents}')
-            else:
-                self.ir.error(f'Invalid signatures on DNSKEY for {self.name} from {ns_origin} from DS from {parents}')
-                return False
+        self.auth_dnskeys.add_response(ns_origin, dnskey_set)
         return True
+
+    def validate_dnskeys(self) -> None:
+        if not self.parent_ds_sets:
+            return
+
+        single_dnskey_set = self.auth_dnskeys.single_response()
+
+        for dnskey_set, origins in self.auth_dnskeys:
+            if not single_dnskey_set or self.ir._debug:
+                self.ir.log(f"{self.name} DNSKEYs from {origins}:")
+                for dnskey in dnskey_set:
+                    self.ir.log(f"* {dnskey}")
+
+            for dsdeleg, parents in self.parent_ds_sets:
+                if dsdeleg.validate_zone_keys(dnskey_set):
+                    self.ir.debug(f"{self.name} DNSKEYs good: from {origins} for DS from {parents}")
+                else:
+                    self.ir.error(f'Invalid signatures on {self.name} DNSKEY from {origins} for DS from {parents}')
 
     async def retrieve_auth_delegation(self, ns_origin: Origin) -> bool:
         l = self.lookup_servers.get(ns_origin)
@@ -1490,7 +1504,7 @@ class CheckNameContext:
         if not await self.retrieve_auth_delegation(ns_origin):
             success = False
         if self.parent_ds_sets:
-            if not await self.check_dnskey(ns_origin):
+            if not await self.retrieve_auth_dnskeys(ns_origin):
                 success = False
         return success
 
@@ -1510,6 +1524,7 @@ class CheckNameContext:
                 nursery.start_soon(handle, ns_origin)
 
         track_auth_responses.check(self.ir, ResponseOriginCheckLimits())
+        self.validate_dnskeys()
 
     async def check_hidden_primary(self, hm: DnsName) -> None:
         assert self.main_soa
