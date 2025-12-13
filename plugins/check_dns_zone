@@ -1193,7 +1193,7 @@ class CheckNameContext:
 
         # Delegations and DS sets in dictionaries where the key represents values that
         # were found mapping to a list of origins the values were received from.
-        # Filled in `retreive_delegations`
+        # Filled in `retrieve_delegations`
         self.parent_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
         self.parent_ds_sets: ResponsesByOrigins[DSDelegation] = ResponsesByOrigins()
 
@@ -1202,7 +1202,7 @@ class CheckNameContext:
         self.main_delegation: Delegation | None = None
 
         # Similar to `parent_delegations`, but results from authoritatives
-        # Filled in `retreive_auth_responses`
+        # Filled in `retrieve_auth_responses`
         self.auth_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
         self.auth_soas = SoaSets()
 
@@ -1242,7 +1242,7 @@ class CheckNameContext:
             for ns in parent_ns_rrset:
                 nursery.start_soon(get_parent_ns_addr, ns.target)
 
-    async def retreive_delegations(self) -> None:
+    async def retrieve_delegations(self) -> None:
         track_delegation = TrackOriginAvailability(context=f"Delegation (NS+DS) from parent zone")
         delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
 
@@ -1483,7 +1483,7 @@ class CheckNameContext:
 
         return True
 
-    async def retreive_auth_response(self, soa_set: SoaSets, ns_origin: Origin) -> bool:
+    async def retrieve_auth_response(self, soa_set: SoaSets, ns_origin: Origin) -> bool:
         success = True
         if not await self.get_soa_into(soa_set, ns_origin):
             success = False
@@ -1494,11 +1494,11 @@ class CheckNameContext:
                 success = False
         return success
 
-    async def retreive_auth_responses(self) -> None:
+    async def retrieve_auth_responses(self) -> None:
         track_auth_responses = TrackOriginAvailability(context="Auths")
 
         async def handle(ns_origin: Origin) -> None:
-            if await self.retreive_auth_response(self.auth_soas, ns_origin):
+            if await self.retrieve_auth_response(self.auth_soas, ns_origin):
                 track_auth_responses.add_origin(ns_origin)
             else:
                 track_auth_responses.add_failed_origin(ns_origin)
@@ -1517,7 +1517,7 @@ class CheckNameContext:
         track_hm = TrackOriginAvailability(context="Hidden Primary")
 
         async def handle(hm_origin: Origin) -> None:
-            if await self.retreive_auth_response(hm_soas, hm_origin):
+            if await self.retrieve_auth_response(hm_soas, hm_origin):
                 track_hm.add_origin(hm_origin)
             else:
                 track_hm.add_failed_origin(hm_origin)
@@ -1633,7 +1633,7 @@ class CheckNameContext:
         private_zone = self.is_private_zone()
         if not private_zone:
             await self.retrieve_parent_addresses()
-            await self.retreive_delegations()
+            await self.retrieve_delegations()
             await self.check_delegations()
 
             auths_by_name = await self.build_merged_delegation()
@@ -1659,7 +1659,7 @@ class CheckNameContext:
 
         self.auths = self.transpose_delegation_auths(auths_by_name)
 
-        await self.retreive_auth_responses()
+        await self.retrieve_auth_responses()
 
         if self.auth_soas.distinct_soas == 0:
             self.ir.error(f'Found no SOA for {self.name}')
