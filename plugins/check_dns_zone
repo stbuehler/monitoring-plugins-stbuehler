@@ -1552,14 +1552,28 @@ class CheckNameContext:
         else:
             self.ir.error(f"Got no delegation (NS) to {self.name} from authoritative {ns_origin}")
 
-    async def get_soa_into(self, soa_set: SoaSets, ns_origin: Origin, track: TrackOriginAvailability) -> None:
-        soa = await self.query_soa(f"Failed to get SOA for {self.name} from {ns_origin}", self.name, ns_origin, track)
+    async def get_soa_into(
+        self,
+        soa_set: SoaSets,
+        ns_origin: Origin,
+        track: TrackOriginAvailability,
+        parent: bool = False,
+    ) -> None:
+        parent_txt = " parent NS" if parent else ""
+        soa = await self.query_soa(f"Failed to get SOA for {self.name} from{parent_txt} {ns_origin}", self.name, ns_origin, track)
         if isinstance(soa, tuple):
             return
         if soa:
             soa_set.insert(soa.data, ns_origin)
         else:
-            self.ir.error(f"Got no SOA for {self.name} from {ns_origin}")
+            if not parent:
+                self.ir.error(f"Got no SOA for {self.name} from {ns_origin}")
+            else:
+                self.ir.trace(f"no SOA (as expected) for {self.name} from parent NS {ns_origin}")
+            return
+
+        if parent:
+            # no further checks on parent NS, even if it has the SOA
             return
 
         other_tcp_only: bool | None = None
@@ -1597,6 +1611,11 @@ class CheckNameContext:
                 nursery.start_soon(self.get_soa_into, self.auth_soas, ns_origin, track_auth_responses)
                 nursery.start_soon(self.retrieve_auth_delegation, ns_origin, track_auth_responses)
                 nursery.start_soon(self.retrieve_auth_dnskeys, ns_origin, track_auth_responses)
+            # If parent NS has a SOA answer it needs to be checked too
+            # (to avoid having a parent NS with an outdated local zone)
+            for parent_origin in self.parents:
+                if not parent_origin.address in self.auths:
+                    nursery.start_soon(self.get_soa_into, self.auth_soas, parent_origin, track_auth_responses, True)
 
         if self.host and self.host in self.auths:
             if self.host in track_auth_responses._failed_origins:
@@ -1764,7 +1783,7 @@ class CheckNameContext:
                 self.ir.debug('SOAs from authoritatives:')
             for soa, sources in self.auth_soas.soa_sets.items():
                 self.ir.log(f'From {sources}:')
-                self.ir.log(f'  {self.name} SOA {soa}')
+                self.ir.log(f'* {self.name} {soa}')
 
         if self.main_soa:
             if not self.main_soa.mname in delegated_auths:
@@ -1778,7 +1797,7 @@ class CheckNameContext:
                 else:
                     self.ir.log(f'Not checking hidden primary as requested')
             else:
-                self.ir.debug(f'SOA mname {self.main_soa.mname} is a public auth, no hidden primary detected')
+                self.ir.log(f'SOA mname {self.main_soa.mname} is a public auth, no hidden primary detected')
 
         # This includes the delegation received from the hidden primary, so
         # `check_hidden_primary` must come before this.
