@@ -1195,12 +1195,13 @@ class CheckNameContext:
         # Origins (names + IP) for authoritative nameservers for the parent zone.
         # If multiple names resolve to the same address, only a single (random) name is selected.
         # Filled in `retrieve_parent_addresses`
+        self.parent_zone = DnsName(".")
         self.parents = OriginSet()
 
         # Delegations and DS sets in dictionaries where the key represents values that
         # were found mapping to a list of origins the values were received from.
         # Filled in `retrieve_delegations`
-        self.parent_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
+        self.parent_delegations: ResponsesByOrigins[Delegation | None] = ResponsesByOrigins()
         self.parent_ds_sets: ResponsesByOrigins[DSDelegation] = ResponsesByOrigins()
 
         # if parent_delegations has exactly one entry, this is its key
@@ -1297,9 +1298,7 @@ class CheckNameContext:
         r = self.lookup_servers.get(origin)
         delegation: Delegation | None | tuple[()] = ()
         with self._dns_exc_context(error_msg, track=track, origin=origin):
-            delegation = await r.delegation(self.name)
-            if not delegation:
-                raise dns.exception.DNSException("No NS records found")
+            delegation = await r.delegation(name)
         return delegation
 
     async def query_ds(
@@ -1354,11 +1353,12 @@ class CheckNameContext:
         parent_ns_rrset = await self.query_parent_zone(self.name)
         if not parent_ns_rrset:
             return
-        self.ir.debug(f'NS for parent zone {parent_ns_rrset.name} of {self.name}: ' + ' '.join(str(ns.target) for ns in parent_ns_rrset))
+        self.parent_zone = parent_ns_rrset.name
+        self.ir.debug(f'NS for parent zone {self.parent_zone} of {self.name}: ' + ' '.join(str(ns.target) for ns in parent_ns_rrset))
 
         async def get_parent_ns_addr(parent_ns: DnsName) -> None:
             addresses = await self.query_addresses(
-                f"Failed to lookup addresses for NS {parent_ns} of parent zone {parent_ns_rrset.name} of {self.name}",
+                f"Failed to lookup addresses for NS {parent_ns} of parent zone {self.parent_zone} of {self.name}",
                 parent_ns,
             )
             if not addresses:
@@ -1367,7 +1367,7 @@ class CheckNameContext:
             for addr in addresses:
                 ex_origin = self.parents.add_unique_address(Origin(name=parent_ns, address=addr))
                 if ex_origin:
-                    self.ir.log(f'IP {addr} duplicate in NS set for {parent_ns_rrset.name} (known as {ex_origin.name} and {parent_ns})')
+                    self.ir.log(f'IP {addr} duplicate in NS set for {self.parent_zone} (known as {ex_origin.name} and {parent_ns})')
             if not parent_ns in self.parents:
                 self.ir.log(f'NS {parent_ns} for parent zone has no unique IPs, removing it from further consideration')
 
@@ -1380,7 +1380,6 @@ class CheckNameContext:
         Retrieve delegation (NS + glue + DS) from parent zone to our zone.
         """
         track_delegation = TrackOriginAvailability(context=f"Delegation (NS+DS) from parent zone")
-        delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
 
         async def get_delegation(ns_origin: Origin) -> None:
             delegation = await self.query_delegation(
@@ -1389,7 +1388,7 @@ class CheckNameContext:
                 ns_origin,
                 track_delegation,
             )
-            if delegation:
+            if not isinstance(delegation, tuple):
                 self.parent_delegations.add_response(ns_origin, delegation)
 
         async def get_ds_delegation(ns_origin: Origin) -> None:
@@ -1409,13 +1408,16 @@ class CheckNameContext:
 
         track_delegation.check(self.ir, ResponseOriginCheckLimits())
 
-        if not self.parent_delegations:
-            # there should have been other errors before, but make sure to log this explicitly
-            self.ir.error(f"No delegations from parent zone")
+        missing_deleg_from = self.parent_delegations.responses.pop(None, None)
+        if missing_deleg_from:
+            if not self.parent_delegations:
+                self.ir.error(f"No delegations (NS) to {self.name} from parent zone {self.parent_zone}")
+                self.ir.debug(f"Queried parent auths: {missing_deleg_from}")
+            else:
+                self.ir.error(f"Missing delegation (NS) to {self.name} from {missing_deleg_from}")
 
     async def check_delegations(self) -> None:
         if len(self.parent_delegations) == 0:
-            self.ir.error(f'No Delegations to {self.name} anywhere')
             return
 
         logged_delegation: set[Delegation] = set()
