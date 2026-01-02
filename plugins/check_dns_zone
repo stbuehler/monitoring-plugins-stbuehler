@@ -1204,7 +1204,7 @@ class CheckNameContext:
         # Delegations and DS sets in dictionaries where the key represents values that
         # were found mapping to a list of origins the values were received from.
         # Filled in `retrieve_delegations`
-        self.parent_delegations: ResponsesByOrigins[Delegation | None] = ResponsesByOrigins()
+        self.parent_delegations: ResponsesByOrigins[Delegation] = ResponsesByOrigins()
         self.parent_ds_sets: ResponsesByOrigins[DSDelegation] = ResponsesByOrigins()
 
         # if parent_delegations has exactly one entry, this is its key
@@ -1383,6 +1383,7 @@ class CheckNameContext:
         Retrieve delegation (NS + glue + DS) from parent zone to our zone.
         """
         track_delegation = TrackOriginAvailability(context=f"Delegation (NS+DS) from parent zone")
+        missing_deleg_from = OriginSet()
 
         async def get_delegation(ns_origin: Origin) -> None:
             delegation = await self.query_delegation(
@@ -1392,7 +1393,10 @@ class CheckNameContext:
                 track_delegation,
             )
             if not isinstance(delegation, tuple):
-                self.parent_delegations.add_response(ns_origin, delegation)
+                if delegation:
+                    self.parent_delegations.add_response(ns_origin, delegation)
+                else:
+                    missing_deleg_from.add(ns_origin)
 
         async def get_ds_delegation(ns_origin: Origin) -> None:
             ds_deleg = await self.query_ds(
@@ -1411,7 +1415,6 @@ class CheckNameContext:
 
         track_delegation.check(self.ir, ResponseOriginCheckLimits())
 
-        missing_deleg_from = self.parent_delegations.responses.pop(None, None)
         if missing_deleg_from:
             if not self.parent_delegations:
                 self.ir.error(f"No delegations (NS) to {self.name} from parent zone {self.parent_zone}")
