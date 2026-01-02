@@ -1000,21 +1000,24 @@ class DnsLookup:
         return Origin.from_resolver_address(address)
 
     @staticmethod
-    def _extract_answer(query: dns.message.Message, response: dns.message.Message) -> dns.rrset.RRset | None:
-        q_rr: dns.rrset.RRset = query.question[0]
-        rr = response.get_rrset(dns.message.ANSWER, q_rr.name, q_rr.rdclass, q_rr.rdtype)
+    def _extract_answer(tx: DnsTransaction) -> dns.rrset.RRset | None:
+        q_rr: dns.rrset.RRset = tx.query.question[0]
+        final_name = q_rr.name
+        seen_aliases = { final_name }
+        while True:
+            cname_rr: dns.rrset.RRset | None = tx.response.get_rrset(dns.message.ANSWER, final_name, q_rr.rdclass, dns.rdatatype.CNAME)
+            if not cname_rr or len(cname_rr) != 1:
+                break
+            final_name = cname_rr[0].target
+            if final_name in seen_aliases:
+                raise DnsInvalidResponseError(transaction=tx, error=f"CNAME loop -> {final_name}")
+            seen_aliases.add(final_name)
+        rr = tx.response.get_rrset(dns.message.ANSWER, final_name, q_rr.rdclass, q_rr.rdtype)
         if rr:
             return rr
         if q_rr.rdtype == dns.rdatatype.NS:
-            rr = response.get_rrset(dns.message.AUTHORITY, q_rr.name, q_rr.rdclass, q_rr.rdtype)
-            if rr:
-                return rr
-        cname_rr: dns.rrset.RRset | None = response.get_rrset(dns.message.ANSWER, q_rr.name, dns.rdataclass.ANY, dns.rdatatype.CNAME)
-        if not cname_rr:
-            return None
-        assert len(cname_rr) == 1
-        cname_entry: dns.rdtypes.ANY.CNAME.CNAME = cname_rr[0]
-        return response.get_rrset(dns.message.ANSWER, cname_entry.target, q_rr.rdclass, q_rr.rdtype)
+            rr = tx.response.get_rrset(dns.message.AUTHORITY, final_name, q_rr.rdclass, q_rr.rdtype)
+        return rr
 
     def __init__(self, *, server: Origin | None = None, tcp_only: bool = False) -> None:
         if server is None:
@@ -1052,7 +1055,7 @@ class DnsLookup:
         rcode = response.rcode()
         if not rcode in (dns.rcode.NOERROR, dns.rcode.NXDOMAIN):
             raise DnsMessageError(transaction=tx)
-        answer = DnsLookup._extract_answer(query, response)
+        answer = DnsLookup._extract_answer(tx)
         return answer, tx
 
     async def query(
