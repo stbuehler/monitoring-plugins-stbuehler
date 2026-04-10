@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+
+import dataclasses
+import subprocess
+import sys
+import typing
+
+
+def installed_packages() -> typing.Iterable[str]:
+    dpkg_res = subprocess.run(
+        ['dpkg', '-l'],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for line in dpkg_res.stdout.splitlines():
+        if line.startswith('ii'):
+            yield line.split(maxsplit=2)[1]
+
+
+def raw_policies():
+    packages = list(installed_packages())
+    return subprocess.run(
+        ['apt-cache', 'policy'] + packages,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class PolicyViolation:
+    package: str
+    candidate: str
+    candidate_prio: int
+    max_prio_available: int
+    max_prio_versions: set[str]
+
+    def __str__(self) -> str:
+        versions = ",".join(sorted(self.max_prio_versions))
+        return (
+            f"Package {self.package} has candidate version {self.candidate} with preference {self.candidate_prio}; "
+            f"the available versions {versions} have higher preference {self.max_prio_available}."
+        )
+
+
+def policies_violations() -> list[PolicyViolation]:
+    raw = raw_policies()
+    pkg = ""
+    candidate = ""
+    candidate_prio = 0
+    installed = ""
+    max_prio = 0
+    max_prio_versions: set[str] = set()
+    result: list[PolicyViolation] = []
+
+    def finalize():
+        nonlocal pkg, candidate, candidate_prio, installed, max_prio, max_prio_versions
+        if pkg:
+            if not candidate in max_prio_versions:
+                result.append(PolicyViolation(
+                    package=pkg,
+                    candidate=candidate,
+                    candidate_prio=candidate_prio,
+                    max_prio_available=max_prio,
+                    max_prio_versions=max_prio_versions,
+                ))
+        pkg = ""
+        candidate = ""
+        candidate_prio = 0
+        installed = ""
+        max_prio = 0
+        max_prio_versions = set()
+
+
+    for line in raw.splitlines():
+        if not line.startswith(' '):
+            finalize()
+            pkg = line.removesuffix(":")
+            continue
+        assert pkg, "Output must start with a package name"
+        if line.startswith('        '):
+            # ignore "source" lines for each package
+            continue
+        if line.startswith('  Candidate:'):
+            candidate = line.split()[1]
+        elif line.startswith('  Installed:'):
+            installed = line.split()[1]
+        elif line.startswith((' *** ', '     ')):
+            version, priority = line[5:].split()
+            prio = int(priority)
+            if version == candidate:
+                candidate_prio = prio
+            if prio > max_prio:
+                max_prio = prio
+                max_prio_versions = { version }
+            elif prio == max_prio:
+                max_prio_versions.add(version)
+    finalize()
+    return result
+
+
+def main():
+    violations = policies_violations()
+    if not violations:
+        print("OK")
+        return
+
+    violations = sorted(violations, key=lambda v: v.package)
+    pkg_names = ", ".join(v.package for v in violations[:10])  # limit status line to 10 package names
+    print(f"WARNING: {len(violations)} package versions installed from not-preferred sources: {pkg_names}")
+    for v in violations:
+        print(v)
+    sys.exit(1)
+
+
+main()

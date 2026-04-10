@@ -3,11 +3,11 @@ Upstream-Name: monitoring-plugins-stbuehler
 Source: https://github.com/stbuehler/monitoring-plugins-stbuehler
 
 Files: *
-Copyright: 2021 Stefan Bühler <stbuehler@web.de>
+Copyright: 2026 Stefan Bühler <stbuehler@web.de>
 License: MIT
 
 Files: debian/*
-Copyright: 2021 Stefan Bühler <stbuehler@web.de>
+Copyright: 2026 Stefan Bühler <stbuehler@web.de>
 License: MIT
 
 License: MIT
