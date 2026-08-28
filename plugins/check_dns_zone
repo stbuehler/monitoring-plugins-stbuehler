@@ -33,6 +33,7 @@ import dns.rrset
 import functools
 import ipaddress
 import sys
+import time
 import trio
 import typing
 
@@ -504,6 +505,24 @@ class RRSet(typing.Generic[TRRData]):
         except dns.dnssec.ValidationFailure:
             return False
         return True
+
+    def rrsig_expires_in(self) -> int:
+        EXPIRE_WRAP_AROUND = 2 ** 32
+        EXPIRE_MAX = 2 ** 30
+
+        now = int(time.time())
+        if not self.rrsig:
+            return 0
+
+        rrsig_expires_in: int | None = None
+        for rrsig in self.rrsig:
+            sig_expires_in = (rrsig._to_dns().expiration - now) % EXPIRE_WRAP_AROUND
+            if sig_expires_in > EXPIRE_MAX:
+                continue
+            if rrsig_expires_in is None or sig_expires_in < rrsig_expires_in:
+                rrsig_expires_in = sig_expires_in
+
+        return rrsig_expires_in or 0
 
 
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
@@ -1542,7 +1561,13 @@ class CheckNameContext:
                 if dnskey_set.rrsig:
                     for dsdeleg, parents in self.parent_ds_sets:
                         if dsdeleg.validate_zone_keys(dnskey_set):
-                            self.ir.debug(f"{self.name} DNSKEYs good: from {origins} for DS from {parents}")
+                            rrsig_expires_in = dnskey_set.rrsig_expires_in()
+                            if rrsig_expires_in < self.opts.rrsig.crit:
+                                self.ir.error(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents} (in {rrsig_expires_in} seconds)')
+                            elif rrsig_expires_in < self.opts.rrsig.warn:
+                                self.ir.warn(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents} (in {rrsig_expires_in} seconds)')
+                            else:
+                                self.ir.debug(f"{self.name} DNSKEYs good: from {origins} for DS from {parents} (expires in {rrsig_expires_in}s)")
                         else:
                             self.ir.error(f'Invalid signatures on {self.name} DNSKEY from {origins} for DS from {parents}')
 
@@ -1859,6 +1884,12 @@ class CheckNameContext:
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
+class DurationLimits:
+    warn: float
+    crit: float
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
 class Options:
     zone: str
     skip_hidden_primary: bool
@@ -1872,6 +1903,35 @@ class Options:
     resolver: str
     host: str
     host_udp: bool
+    rrsig: DurationLimits
+
+    _DURATION_UNITS: typing.ClassVar[dict[str, int]] = {
+        "s": 1,
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+        "w": 7*86400,
+    }
+
+    @staticmethod
+    def _duration(param: str) -> float:
+        factor = 1
+        for suffix, suffix_factor in Options._DURATION_UNITS.items():
+            if param.endswith(suffix):
+                param = param.removesuffix(suffix)
+                factor = suffix_factor
+                break
+        try:
+            return float(param) * factor
+        except ValueError:
+            raise argparse.ArgumentError(f"invalid time duration {param!r}")
+
+    @staticmethod
+    def _duration_limits(param: str) -> DurationLimits:
+        if not "," in param:
+            raise argparse.ArgumentError("expect ',' separated duration values for warn,crit")
+        warn, crit = param.split(",", maxsplit=1)
+        return DurationLimits(warn=Options._duration(warn), crit=Options._duration(crit))
 
     @staticmethod
     def parse() -> Options:
@@ -1888,6 +1948,7 @@ class Options:
         p.add_argument('--resolver', action='store', help="Use given address as DNS resolver")
         p.add_argument('--host', action='store', help="Make sure zone is hosted on given host")
         p.add_argument('--host-udp', action='store_true', help="Check SOA via UDP too (when --auth-tcp is used) for nameserver given via --host")
+        p.add_argument('--rrsig', type=Options._duration_limits, help="RRSIG expiration limits", default="3d,6.5d")
         opts = p.parse_args()
         return Options(**opts.__dict__)
 
