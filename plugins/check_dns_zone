@@ -10,6 +10,7 @@ import abc
 import argparse
 import contextlib
 import dataclasses
+import datetime
 import dns
 import dns.asyncquery
 import dns.dnssec
@@ -21,7 +22,6 @@ import dns.rdata
 import dns.rdataclass
 import dns.rdataset
 import dns.rdatatype
-import dns.rdtypes.ANY.CNAME
 import dns.rdtypes.ANY.DNSKEY
 import dns.rdtypes.ANY.DS
 import dns.rdtypes.ANY.NS
@@ -30,10 +30,8 @@ import dns.rdtypes.IN.A
 import dns.rdtypes.IN.AAAA
 import dns.resolver
 import dns.rrset
-import functools
 import ipaddress
 import sys
-import time
 import trio
 import typing
 
@@ -151,7 +149,6 @@ class RRDataBase(abc.ABC, typing.Generic[TDnsRDATA]):
         for rr in rrset:
             assert isinstance(rr, cls._DNS_TYPE)
             data.append(cls._from_dns(rr))
-        rrsig: RRSIG | None = None
         return RRSet._from_dns(rrset, data, rrsig_set)
 
     # mypy complains with `You may not have a custom "__lt__" method when "order" is True`
@@ -172,6 +169,8 @@ class RRDataSOA(RRDataBase[dns.rdtypes.ANY.SOA.SOA]):
     retry: int  # retry of refresh, must be less than refresh
     expire: int  # time after which secondary should consider zone stale if refresh didn't work
     minimum: int  # TTL (upper bound) of negative responses (SOA TTL itself is the other upper bound)
+
+    rrsig: RRDataRRSIG | None = None  # if we don't keep the full RRSet around store rrsig here
 
     def __str__(self) -> str:
         return f"SOA {self.mname} {self.rname} {self.serial} {self.refresh} {self.retry} {self.expire} {self.minimum}"
@@ -395,6 +394,74 @@ class RRDataDNSKEY(RRDataBase[dns.rdtypes.ANY.DNSKEY.DNSKEY]):
         return dns_key
 
 
+@dataclasses.dataclass(slots=True, kw_only=True)
+class RRSIGInfo:
+    inception: datetime.datetime
+    expiration: datetime.datetime
+    lifetime: datetime.duration
+    expires_in: datetime.duration | None
+
+    @staticmethod
+    def make(inception: int, expiration: int) -> RRSIGInfo:
+        EXPIRE_WRAP_AROUND = 2 ** 32
+
+        dt_now = datetime.datetime.now(tz=datetime.UTC).replace(microsecond=0)
+        now = int(dt_now.timestamp())
+        if expiration < inception:
+            expiration += EXPIRE_WRAP_AROUND
+
+        # find N:
+        # * offset = N * EXPIRE_WRAP_AROUND
+        # * minimize: abs(now - (offset + inception))
+        #   (usually `now > offset + inception`, assuming inception was in the past)
+        n = round((now - inception) / EXPIRE_WRAP_AROUND)
+        offset = n * EXPIRE_WRAP_AROUND
+
+        inception += offset
+        expiration += offset
+
+        dt_inc = datetime.datetime.fromtimestamp(inception, tz=datetime.UTC)
+        dt_exp = datetime.datetime.fromtimestamp(expiration, tz=datetime.UTC)
+
+        expires_in: datetime.duration | None
+        if dt_inc <= dt_now < dt_exp:
+            expires_in = dt_exp - dt_now
+        else:
+            expires_in = None
+
+        return RRSIGInfo(
+            inception=dt_inc,
+            expiration=dt_exp,
+            lifetime=dt_exp - dt_inc,
+            expires_in=expires_in,
+        )
+
+    @property
+    def valid(self) -> bool:
+        return not self.expires_in is None
+
+    def __str__(self) -> str:
+        inc = self.inception.isoformat(timespec="minutes")
+        exp = self.expiration.isoformat(timespec="minutes")
+        lt = str(self.lifetime)
+        exp_in = str(self.expires_in)
+        if self.expires_in is None:
+            return f"Invalid signature (inc: {inc}, exp: {exp}, lifetime: {lt})"
+        return f"Signature expires in {exp_in} (inc: {inc}, exp: {exp}, lifetime: {lt})"
+
+    def more_current(self, other: RRSIGInfo | None) -> RRSIGInfo:
+        if other is None:
+            return self
+        if self.valid != other.valid:
+            if self.valid:
+                return self
+            else:
+                return other
+        if self.expiration > other.expiration:
+            return self
+        return other
+
+
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True, order=True)
 class RRDataRRSIG(RRDataBase[dns.rdtypes.ANY.RRSIG.RRSIG]):
     _RRDATATYPE = dns.rdatatype.RRSIG
@@ -429,6 +496,10 @@ class RRDataRRSIG(RRDataBase[dns.rdtypes.ANY.RRSIG.RRSIG]):
             rrsig = rdata
             super(RRDataRRSIG, self).__setattr__("_cached_rrsig", rrsig)
         return rrsig
+
+    def info(self) -> RRSIGInfo:
+        rdata = self._to_dns()
+        return RRSIGInfo.make(rdata.inception, rdata.expiration)
 
 
 TRRData = typing.TypeVar("TRRData", bound=RRDataBase)
@@ -506,23 +577,20 @@ class RRSet(typing.Generic[TRRData]):
             return False
         return True
 
-    def rrsig_expires_in(self) -> int:
-        EXPIRE_WRAP_AROUND = 2 ** 32
-        EXPIRE_MAX = 2 ** 30
+    def best_valid_rrsig_info(self, dnskey_set: RRSet[RRDataDNSKEY]) -> RRSIGInfo | None:
+        assert self.rrsig
+        rdata = self._to_dns()
+        keyset = { dnskey_set.name._name: dnskey_set._to_dns() }
+        rrsiginfo: RRSIGInfo | None = None
 
-        now = int(time.time())
-        if not self.rrsig:
-            return 0
-
-        rrsig_expires_in: int | None = None
         for rrsig in self.rrsig:
-            sig_expires_in = (rrsig._to_dns().expiration - now) % EXPIRE_WRAP_AROUND
-            if sig_expires_in > EXPIRE_MAX:
+            try:
+                dns.dnssec.validate_rrsig(rdata, rrsig._to_dns(), keyset)
+            except dns.dnssec.ValidationFailure:
                 continue
-            if rrsig_expires_in is None or sig_expires_in < rrsig_expires_in:
-                rrsig_expires_in = sig_expires_in
+            rrsiginfo = rrsig.info().more_current(rrsiginfo)
 
-        return rrsig_expires_in or 0
+        return rrsiginfo
 
 
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
@@ -542,18 +610,24 @@ class DSDelegation:
                 result.append(key._to_dns())
         return { self.name._name: dns.rdataset.from_rdata_list(dnskey_set.ttl, result) }
 
-    def validate_zone_keys(self, dnskey_set: RRSet[RRDataDNSKEY]) -> bool:
+    def validate_zone_keys(self, dnskey_set: RRSet[RRDataDNSKEY]) -> RRSIGInfo | None:
         assert dnskey_set.rrsig
         acceptable_dnskeys = self._filter_dnskeys(dnskey_set)
-        try:
-            dns.dnssec.validate(
-                dnskey_set._to_dns(),
-                (dnskey_set.rrsig.name._name, dnskey_set.rrsig._to_dns()),
-                acceptable_dnskeys,
-            )
-        except dns.dnssec.ValidationFailure:
-            return False
-        return True
+        rdata = dnskey_set._to_dns()
+        rrsiginfo: RRSIGInfo | None = None
+
+        for rrsig in dnskey_set.rrsig:
+            try:
+                dns.dnssec.validate_rrsig(
+                    rdata,
+                    rrsig._to_dns(),
+                    acceptable_dnskeys,
+                )
+            except dns.dnssec.ValidationFailure:
+                continue
+            rrsiginfo = rrsig.info().more_current(rrsiginfo)
+
+        return rrsiginfo
 
 
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
@@ -1102,7 +1176,7 @@ class DnsLookup:
         soa_rrs = soa_set.rrs()
         if len(soa_rrs) != 1:
             raise DnsInvalidResponseError(transaction=tx, error="Not exactly one record in answer for SOA")
-        return soa_rrs[0]
+        return dataclasses.replace(soa_rrs[0], data=dataclasses.replace(soa_rrs[0].data, rrsig=soa_set.rrsig))
 
     async def ns(self, name: DnsName) -> RRSet[RRDataNS] | None:
         return (await self.query(name, RRDataNS))[0]
@@ -1540,36 +1614,63 @@ class CheckNameContext:
         single_dnskey_set = self.auth_dnskeys.single_response()
         show_all_dnskeys = not single_dnskey_set or self.ir._debug or not self.parent_ds_sets
 
+        for soa, soa_origin in self.auth_soas.soa_sets.items():
+            if not soa.rrsig:
+                self.ir.error(f'Missing signatures on {self.name} SOA from {soa_origin}')
+
         for dnskey_set, origins in self.auth_dnskeys:
             if dnskey_set is None:
                 if self.parent_ds_sets:
                     self.ir.error(f"Delegation secured by DS, but no DNSKEYS for {self.name} from {origins}")
                 else:
                     self.ir.debug(f"No DS in delegation, and no DNSKEYs for {self.name} (as expected) from {origins}")
-            else:
-                if not dnskey_set.rrsig:
-                    self.ir.error(f"DNSKEYs for {self.name} not signed from {origins}")
+                return
 
-                if not self.parent_ds_sets:
-                    self.ir.info(f"No DS in delegation, but found DNSKEYs for {self.name} from {origins}")
+            if not dnskey_set.rrsig:
+                self.ir.error(f"DNSKEYs for {self.name} not signed from {origins}")
 
-                if show_all_dnskeys or not dnskey_set.rrsig:
-                    self.ir.log(f"{self.name} DNSKEYs from {origins}:")
-                    for dnskey in dnskey_set:
-                        self.ir.log(f"* {dnskey}")
+            if not self.parent_ds_sets:
+                self.ir.info(f"No DS in delegation, but found DNSKEYs for {self.name} from {origins}")
 
-                if dnskey_set.rrsig:
-                    for dsdeleg, parents in self.parent_ds_sets:
-                        if dsdeleg.validate_zone_keys(dnskey_set):
-                            rrsig_expires_in = dnskey_set.rrsig_expires_in()
-                            if rrsig_expires_in < self.opts.rrsig.crit:
-                                self.ir.error(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents} (in {rrsig_expires_in} seconds)')
-                            elif rrsig_expires_in < self.opts.rrsig.warn:
-                                self.ir.warn(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents} (in {rrsig_expires_in} seconds)')
-                            else:
-                                self.ir.debug(f"{self.name} DNSKEYs good: from {origins} for DS from {parents} (expires in {rrsig_expires_in}s)")
+            if show_all_dnskeys or not dnskey_set.rrsig:
+                self.ir.log(f"{self.name} DNSKEYs from {origins}:")
+                for dnskey in dnskey_set:
+                    self.ir.log(f"* {dnskey}  # tag {dnskey.key_tag}")
+
+            if dnskey_set.rrsig:
+                for dsdeleg, parents in self.parent_ds_sets:
+                    best_rrsig_info = dsdeleg.validate_zone_keys(dnskey_set)
+                    if not best_rrsig_info is None:
+                        if best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.crit:
+                            self.ir.error(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents}: {best_rrsig_info}')
+                        elif best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.warn:
+                            self.ir.warn(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents}: {best_rrsig_info}')
                         else:
-                            self.ir.error(f'Invalid signatures on {self.name} DNSKEY from {origins} for DS from {parents}')
+                            self.ir.debug(f"{self.name} DNSKEYs good: from {origins} for DS from {parents}: {best_rrsig_info}")
+                    else:
+                        self.ir.error(f'Invalid signatures on {self.name} DNSKEY from {origins} for DS from {parents}')
+
+            for soa, soa_origin in self.auth_soas.soa_sets.items():
+                if not soa.rrsig:
+                    continue
+                soa_rrset = RRSet(
+                    name=self.name,
+                    ttl=0,
+                    rdclass=soa.rrsig.rdclass,
+                    data=tuple([dataclasses.replace(soa, rrsig=None)]),
+                    rrsig=soa.rrsig,
+                )
+                best_rrsig_info = soa_rrset.best_valid_rrsig_info(dnskey_set)
+                if not best_rrsig_info is None:
+                    if best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.crit:
+                        self.ir.error(f'Signature expires soon: on {self.name} SOA from {soa_origin} via DNSKEY from {origins}: {best_rrsig_info}')
+                    elif best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.warn:
+                        self.ir.warn(f'Signature expires soon: on {self.name} SOA from {soa_origin} via DNSKEY from {origins}: {best_rrsig_info}')
+                    else:
+                        self.ir.debug(f"{self.name} SOA RRSIG good: from {soa_origin} via DNSKEY from {origins}: {best_rrsig_info}")
+                else:
+                    self.ir.error(f'Invalid signatures on {self.name} SOA from {soa_origin} via DNSKEY from {origins}')
+
 
     async def retrieve_auth_delegation(self, ns_origin: Origin, track: TrackOriginAvailability) -> None:
         delegation = await self.query_delegation(
@@ -1688,6 +1789,7 @@ class CheckNameContext:
         ))
 
         for soa, sources in hm_soas.soa_sets.items():
+            soa = dataclasses.replace(soa, rrsig=None)  # don't check/compare RRSIG
             # no need to print name for sources - there is only a single hidden primary
             sources_str = ' '.join(map(str, sources))
             if self.main_soa != soa:
