@@ -1930,7 +1930,7 @@ class Options:
     def _duration_limits(param: str) -> DurationLimits:
         if not "," in param:
             raise argparse.ArgumentError("expect ',' separated duration values for warn,crit")
-        warn, crit = param.split(",", maxsplit=1)
+        crit, warn = param.split(",", maxsplit=1)
         return DurationLimits(warn=Options._duration(warn), crit=Options._duration(crit))
 
     @staticmethod
