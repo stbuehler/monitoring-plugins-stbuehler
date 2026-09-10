@@ -171,7 +171,7 @@ class RRDataSOA(RRDataBase[dns.rdtypes.ANY.SOA.SOA]):
     expire: int  # time after which secondary should consider zone stale if refresh didn't work
     minimum: int  # TTL (upper bound) of negative responses (SOA TTL itself is the other upper bound)
 
-    rrsig: RRDataRRSIG | None = None  # if we don't keep the full RRSet around store rrsig here
+    rrsig: RRSet[RRDataRRSIG] | None = None  # if we don't keep the full RRSet around store rrsig here
 
     def __str__(self) -> str:
         return f"SOA {self.mname} {self.rname} {self.serial} {self.refresh} {self.retry} {self.expire} {self.minimum}"
@@ -399,8 +399,8 @@ class RRDataDNSKEY(RRDataBase[dns.rdtypes.ANY.DNSKEY.DNSKEY]):
 class RRSIGInfo:
     inception: datetime.datetime
     expiration: datetime.datetime
-    lifetime: datetime.duration
-    expires_in: datetime.duration | None
+    lifetime: datetime.timedelta
+    expires_in: datetime.timedelta | None
 
     @staticmethod
     def make(inception: int, expiration: int) -> RRSIGInfo:
@@ -424,7 +424,7 @@ class RRSIGInfo:
         dt_inc = datetime.datetime.fromtimestamp(inception, tz=datetime.UTC)
         dt_exp = datetime.datetime.fromtimestamp(expiration, tz=datetime.UTC)
 
-        expires_in: datetime.duration | None
+        expires_in: datetime.timedelta | None
         if dt_inc <= dt_now < dt_exp:
             expires_in = dt_exp - dt_now
         else:
@@ -581,7 +581,9 @@ class RRSet(typing.Generic[TRRData]):
     def best_valid_rrsig_info(self, dnskey_set: RRSet[RRDataDNSKEY]) -> RRSIGInfo | None:
         assert self.rrsig
         rdata = self._to_dns()
-        keyset = { dnskey_set.name._name: dnskey_set._to_dns() }
+        keyset: dict[dns.name.Name, dns.node.Node | dns.rdataset.Rdataset] = {
+            dnskey_set.name._name: dnskey_set._to_dns()
+        }
         rrsiginfo: RRSIGInfo | None = None
 
         for rrsig in self.rrsig:
@@ -1641,7 +1643,7 @@ class CheckNameContext:
             if dnskey_set.rrsig:
                 for dsdeleg, parents in self.parent_ds_sets:
                     best_rrsig_info = dsdeleg.validate_zone_keys(dnskey_set)
-                    if not best_rrsig_info is None:
+                    if not best_rrsig_info is None and not best_rrsig_info.expires_in is None:
                         if best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.crit:
                             self.ir.error(f'Signature expires soon: on {self.name} DNSKEY from {origins} for DS from {parents}: {best_rrsig_info}')
                         elif best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.warn:
@@ -1662,7 +1664,7 @@ class CheckNameContext:
                     rrsig=soa.rrsig,
                 )
                 best_rrsig_info = soa_rrset.best_valid_rrsig_info(dnskey_set)
-                if not best_rrsig_info is None:
+                if not best_rrsig_info is None and not best_rrsig_info.expires_in is None:
                     if best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.crit:
                         self.ir.error(f'Signature expires soon: on {self.name} SOA from {soa_origin} via DNSKEY from {origins}: {best_rrsig_info}')
                     elif best_rrsig_info.expires_in.total_seconds() < self.opts.rrsig.warn:
@@ -2027,12 +2029,12 @@ class Options:
         try:
             return float(param) * factor
         except ValueError:
-            raise argparse.ArgumentError(f"invalid time duration {param!r}")
+            raise argparse.ArgumentTypeError(f"invalid time duration {param!r}")
 
     @staticmethod
     def _duration_limits(param: str) -> DurationLimits:
         if not "," in param:
-            raise argparse.ArgumentError("expect ',' separated duration values for warn,crit")
+            raise argparse.ArgumentTypeError("expect ',' separated duration values for warn,crit")
         crit, warn = param.split(",", maxsplit=1)
         return DurationLimits(warn=Options._duration(warn), crit=Options._duration(crit))
 
