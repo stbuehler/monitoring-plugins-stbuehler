@@ -1617,10 +1617,6 @@ class CheckNameContext:
         single_dnskey_set = self.auth_dnskeys.single_response()
         show_all_dnskeys = not single_dnskey_set or self.ir._debug or not self.parent_ds_sets
 
-        for soa, soa_origin in self.auth_soas.soa_sets.items():
-            if not soa.rrsig:
-                self.ir.error(f'Missing signatures on {self.name} SOA from {soa_origin}')
-
         for dnskey_set, origins in self.auth_dnskeys:
             if dnskey_set is None:
                 if self.parent_ds_sets:
@@ -1674,6 +1670,10 @@ class CheckNameContext:
                 else:
                     self.ir.error(f'Invalid signatures on {self.name} SOA from {soa_origin} via DNSKEY from {origins}')
 
+        if self.parent_ds_sets:
+            for soa, soa_origin in self.auth_soas.soa_sets.items():
+                if not soa.rrsig:
+                    self.ir.error(f'Missing signatures on {self.name} SOA from {soa_origin} (but delegation secured by DS)')
 
     async def retrieve_auth_delegation(self, ns_origin: Origin, track: TrackOriginAvailability) -> None:
         delegation = await self.query_delegation(
