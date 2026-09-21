@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 import argparse
+import base64
 import contextlib
 import dataclasses
 import datetime
@@ -359,7 +360,7 @@ class RRDataDNSKEY(RRDataBase[dns.rdtypes.ANY.DNSKEY.DNSKEY]):
     _cached_dns_key: dns.rdtypes.ANY.DNSKEY.DNSKEY | None = dataclasses.field(default=None, repr=False, hash=False, compare=False)
 
     def __str__(self) -> str:
-        return f"DNSKEY {self.flags} {self.protocol} {self.algorithm} {self.key.hex()}"
+        return f"DNSKEY {self.flags} {self.protocol} {self.algorithm} {base64.b64encode(self.key).decode()}"
 
     @property
     def key_tag(self) -> int:
