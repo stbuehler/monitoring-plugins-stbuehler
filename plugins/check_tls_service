@@ -1,0 +1,2106 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import dataclasses
+import datetime
+import enum
+import hashlib
+import ipaddress
+import os.path
+import re
+import secrets
+import socket
+import struct
+import sys
+import tempfile
+import traceback
+import typing
+import urllib.request
+
+import OpenSSL.SSL
+import OpenSSL.crypto
+import cryptography.x509
+import cryptography.x509.extensions
+import cryptography.x509.oid
+
+
+DEFAULT_NAGIOS_STATE_DIR = "/var/lib/nagios"
+
+
+class NagiosCode(enum.IntEnum):
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
+
+
+class NagiosAbort(BaseException):
+    pass
+
+
+class NagiosResult:
+    def __init__(self) -> None:
+        self.code: NagiosCode | None = None
+        self.headline: str = ""
+        self.messages: list[str] = []
+        self.performances: list[str] = []
+        self.debug_level = 0
+
+    def performance(self, label: str, value: str) -> None:
+        assert not " " in value
+        assert not "=" in label
+        if " " in label or "'" in label:
+            label = "'" + label.replace("'", "''") + "'"
+        self.performances.append(f"{label}={value}")
+
+    def _set_code(self, code: NagiosCode, headline: str, *, prefix_code: bool = False) -> None:
+        self.code = code
+        if headline:
+            self.headline = f"{code.name} - {headline}"
+        else:
+            self.headline = code.name
+
+    def ok(self, msg: str, *, prefix_code: bool = False) -> None:
+        if self.code is None:
+            self._set_code(NagiosCode.OK, msg, prefix_code=prefix_code)
+
+    def message(self, msg: str, code: NagiosCode | None = None) -> None:
+        if not code is None:
+            if (
+                self.code is None  # no code yet
+                or (code != NagiosCode.UNKNOWN and code > self.code) # "worse" code than we had before
+                or (code == NagiosCode.UNKNOWN and self.code == NagiosCode.OK) # UNKNOWN worse than OK
+            ):
+                self._set_code(code, msg)
+        self.messages.append(msg)
+
+    def warning(self, msg: str) -> None:
+        self.message(msg=msg, code=NagiosCode.WARNING)
+
+    @typing.overload
+    def critical(self, msg: str) -> typing.NoReturn:
+        ...
+    @typing.overload
+    def critical(self, msg: str, *, abort: typing.Literal[True]) -> typing.NoReturn:
+        ...
+    @typing.overload
+    def critical(self, msg: str, *, abort: bool) -> None:
+        ...
+    def critical(self, msg, *, abort=True) -> None:
+        self.message(msg=msg, code=NagiosCode.CRITICAL)
+        if abort:
+            raise NagiosAbort()
+
+    def debug(self, msg: str | typing.Callable[[], str], *, level: int = 1) -> None:
+        if level > self.debug_level:
+            return
+        if not isinstance(msg, str):
+            msg = msg()
+        self.messages.append(msg)
+
+    def finish(self) -> typing.NoReturn:
+        if self.code is None:
+            self._set_code(NagiosCode.OK, "")
+        assert not self.code is None
+        print(self.headline.replace("|", "_") + "|" + " ".join(self.performances))
+        for msg in self.messages:
+            print(msg)
+        sys.exit(int(self.code))
+
+    @staticmethod
+    @contextlib.contextmanager
+    def run() -> typing.Generator[NagiosResult, None, None]:
+        result = NagiosResult()
+        try:
+            yield result
+        except NagiosAbort:
+            pass
+        except (KeyboardInterrupt, InterruptedError):
+            result.critical("Interrupted", abort=False)
+        except Exception as e:
+            import io
+            buffer = io.StringIO()
+            result.critical(f"UNCAUGHT EXCEPTION: {e}", abort=False)
+            traceback.print_exception(e, file=buffer)
+            result.messages.extend(buffer.getvalue().splitlines())
+        result.finish()
+
+
+# ASN.1 helpers
+@dataclasses.dataclass
+class ASN1Object:
+    tag: int
+    value: list[ASN1Object] | bytes
+
+    # UNIVERSAL = 0x00
+    APPLICATION: typing.ClassVar[int] = 0x40
+    CONTEXT_SPECIFIC: typing.ClassVar[int] = 0x80
+    PRIVATE: typing.ClassVar[int] = 0xc0
+
+    INTEGER: typing.ClassVar[int] = 0x02
+    OCTET_STRING: typing.ClassVar[int] = 0x04
+    ENUMERATED: typing.ClassVar[int] = 0x0a
+    SEQUENCE: typing.ClassVar[int] = 0x10
+
+    @property
+    def constructed(self) -> bool:
+        return isinstance(self.value, list)
+
+    @staticmethod
+    def from_int(value: int, *, tag: int = INTEGER, signed: bool = True) -> ASN1Object:
+        bits = value.bit_count()
+        if signed:
+            bits += 1
+        else:
+            assert value >= 0
+        len = (bits + 7) // 8
+        return ASN1Object(tag=tag, value=value.to_bytes(len, signed=signed))
+
+    def data_as_int(self) -> int:
+        assert isinstance(self.value, bytes)
+        return int.from_bytes(self.value, signed=True)
+
+    @staticmethod
+    def decode(data: bytes | memoryview) -> ASN1Object:
+        data, obj = ASN1Object.decode_step(memoryview(data))
+        if data:
+            raise ValueError("Too much data")
+        return obj
+
+    @staticmethod
+    def decode_step(data: memoryview) -> tuple[memoryview, ASN1Object]:
+        def find_nul_nul(data: memoryview) -> int | None:
+            for ndx in range(len(data) - 1):
+                if data[ndx] == 0 and data[ndx + 1] == 0:
+                    return ndx
+            return None
+
+        if len(data) < 2:
+            raise EOFError()
+        tag = data[0]
+        constructed = (tag & 0x20) != 0
+        tag = tag & ~0x20  # drop constructed/primitive flag from tag
+        payload_offset = 2
+        payload_skip = 0
+        payload_len: int
+        if data[1] & 0x80:
+            len_len = data[1] & ~0x80
+            if len_len == 0:
+                end: int | None = find_nul_nul(data)
+                if end is None:
+                    raise EOFError("missing NUL NUL terminator for indefinitive form")
+                payload_len = end - 2
+                payload_skip = 2
+            else:
+                if len(data) < 2 + len_len:
+                    raise EOFError()
+                payload_offset += len_len
+                payload_len = int.from_bytes(data[2:][:len_len])
+        else:
+            payload_len = data[1]
+        if len(data) < payload_offset + payload_len + payload_skip:
+            raise EOFError()
+        payload_view = data[payload_offset:][:payload_len]
+        data = data[payload_offset + payload_len + payload_skip:]
+        value: bytes | list[ASN1Object]
+        if constructed:
+            value = ASN1Object._decode_list(payload_view)
+        else:
+            value = bytes(payload_view)
+        return (data, ASN1Object(tag=tag, value=value))
+
+    @staticmethod
+    def _decode_list(data: memoryview) -> list[ASN1Object]:
+        result: list[ASN1Object] = []
+        while data:
+            data, obj = ASN1Object.decode_step(data)
+            result.append(obj)
+        return result
+
+    @staticmethod
+    def _encode_len(len: int) -> bytes:
+        assert len >= 0
+        if len < 0x80:
+            return len.to_bytes(1)
+        len_len = (len.bit_length() + 7) // 8
+        assert len_len < 0x80
+        return (len_len + 0x80).to_bytes(1) + len.to_bytes(len_len)
+
+    def encode_into(self, buffer: bytearray) -> None:
+        tag = self.tag | (0x20 if self.constructed else 0)
+        buffer.append(tag)
+        if isinstance(self.value, list):
+            offset = len(buffer)
+            for value in self.value:
+                value.encode_into(buffer)
+            # insert length before nested data
+            buffer[offset:offset] = self._encode_len(len(buffer) - offset)
+        else:
+            buffer.extend(self._encode_len(len(self.value)))
+            buffer.extend(self.value)
+
+    def encode(self) -> bytearray:
+        buffer = bytearray()
+        self.encode_into(buffer)
+        return buffer
+
+
+class Protocol(enum.StrEnum):
+    SMTP = "smtp"
+    SMTPS = "smtps"
+    POP3 = "pop3"
+    DNS = "dns"
+    FTP = "ftp"  # alias: "ftps"
+    POP3S = "pop3s"
+    LDAP = "ldap"
+    LDAPS = "ldaps"
+    IMAP = "imap"
+    IMAPS = "imaps"
+    POSTGRES = "postgres"  # alias "postgresql"
+    SIEVE = "sieve"
+    # "http" used to check https on port 80; if you want that just specify port 80
+    # HTTP = "http"
+    HTTPS = "https"
+    H2 = "h2"
+    H3 = "h3"
+    MQTTS = "mqtts"
+    MYSQL = "mysql"
+    SIPS = "sips"
+    XMPP = "xmpp"
+    XMPP_SERVER = "xmpp-server"
+    TDS = "tds"
+
+    @staticmethod
+    def from_str(name: str) -> Protocol:
+        # handle aliases
+        if name == "ftps":
+            return Protocol.FTP
+        if name == "postgresql":
+            return Protocol.POSTGRES
+        return Protocol(name)
+
+    @staticmethod
+    def starttls_smtp(args: Arguments, stream: BufferedSocket) -> None:
+        def get_reply() -> tuple[int, list[bytes]]:
+            lines: list[bytes] = []
+            code: int | None = None
+            while True:
+                line = stream.recv_line(1024, separator=b"\r\n")
+                if len(line) > 512:
+                    # https://datatracker.ietf.org/doc/html/rfc5321#section-4.5.3.1.5
+                    raise ValueError(f"Invalid SMTP reply line {line!r} (too long)")
+                if len(line) < 3 or not line[:3].isdigit():
+                    raise ValueError(f"Invalid SMTP reply line {line!r} (missing 3-digit code)")
+                line_code = int(line[:3])
+                if code is None:
+                    code = line_code
+                elif code != line_code:
+                    # https://datatracker.ietf.org/doc/html/rfc5321#section-4.2.1 (last paragraph)
+                    raise ValueError(f"Different codes in SMTP multiline reply; first code was {code}, got {line!r}")
+                if len(line) == 3:
+                    # servers should append SP even when there is no text
+                    lines.append(b'')
+                else:
+                    # got at least 4 bytes; remember text
+                    lines.append(line[4:].rstrip(b'\r\n'))
+                    ind = line[3:4]
+                    if ind == b' ':
+                        break  # final reply line
+                    elif ind != b'-':
+                        raise ValueError(f"Invalid response line {line!r} (missing SP or '-' after code)")
+                if len(lines) >= 30:
+                    raise ValueError(f"Too many SMTP reply lines")
+            return (code, lines)
+
+        # wait for greeting from server
+        greeting_code, greeting_lines = get_reply()
+        if greeting_code != 220:
+            raise ValueError(f"Unexpected SMTP greeting (!= 220): {greeting_code} {greeting_lines}")
+
+        # send EHLO
+        stream.sendall(f"EHLO {socket.gethostname()}\r\n".encode())
+        ehlo_code, ehlo_lines = get_reply()
+        if ehlo_code != 250:
+            raise ValueError(f"Unexpected SMTP EHLO reply (!= 250): {ehlo_code} {ehlo_lines}")
+        for ehlo_line in ehlo_lines[1:]:  # search for keywords, but not in first reply line
+            if ehlo_line.split(b' ', maxsplit=1)[0] == b"STARTTLS":
+                break
+        else:
+            raise ValueError(f"SMTP EHLO reply didn't contain the STARTTLS keyword: {ehlo_code} {ehlo_lines}")
+
+        # send STARTTLS
+        stream.sendall(b"STARTTLS\r\n")
+        starttls_code, starttls_lines = get_reply()
+        if starttls_code != 220:
+            raise ValueError(f"SMTP STARTTLS failed with: {starttls_code} {starttls_lines}")
+
+    @staticmethod
+    def starttls_pop3(args: Arguments, stream: BufferedSocket) -> None:
+        def get_reply() -> tuple[bool, bytes]:
+            # only single-line replies supported; we don't send commands that expect multi-line replies.
+            line = stream.recv_line(1024, separator=b"\r\n")
+            if len(line) > 512:
+                # https://www.rfc-editor.org/rfc/rfc1939#section-3
+                raise ValueError(f"Invalid POP3 reply line {line!r} (too long)")
+            parts = line.split(b' ', maxsplit=1)
+            success = (parts[0] == b"+OK")
+            return (success, line.rstrip(b"\r\b"))
+
+        greeting_ind, greeting_msg = get_reply()
+        if not greeting_ind:
+            raise ValueError(f"Unexpected POP3 greeting: {greeting_msg!r}")
+
+        stream.sendall(b"STLS\r\n")
+        starttls_ind, starttls_msg = get_reply()
+        if not starttls_ind:
+            raise ValueError(f"POP3 STARTTLS (STLS) failed: {starttls_msg!r}")
+
+    @staticmethod
+    def starttls_imap(args: Arguments, stream: BufferedSocket) -> None:
+        capabilities: set[bytes] = set()
+
+        def get_reply(expect_greeting: bool = False) -> tuple[bytes, list[bytes]]:
+            nonlocal capabilities  # CAPABILITY can be received anytime
+            # literals not supported
+            lines: list[bytes] = []
+            while True:
+                line = stream.recv_line(4096, separator=b"\r\n")
+                if len(line) > 2048:
+                    # unclear if there is a "standard" limit?
+                    raise ValueError(f"IMAP response line too long")
+                tag, data = line.rstrip(b'\r\n').split(b' ', maxsplit=1)
+                if tag == b'+':
+                    # we don't send synchronized literals
+                    raise ValueError(f"Unexpected continue response {line!r}")
+                if tag == b'*':
+                    if data[:4].upper().startswith(b'BYE '):
+                        raise EOFError(f"Server wants to end connection: {data!r}")
+                    elif data.upper().startswith(b"CAPABILITY "):
+                        # might come before greeting?
+                        capabilities |= set(data.upper().removeprefix(b"CAPABILITY ").split(b" "))
+                    elif expect_greeting:
+                        return (data, lines)
+                    else:
+                        lines.append(data)
+                else:
+                    # we use "." as tag for all commands
+                    if expect_greeting or tag != b".":
+                        raise ValueError("Unexpected response tag")
+                    return (data, lines)
+
+        greeting, _ = get_reply(expect_greeting=True)
+        if not greeting.upper().startswith((b"OK ", b"PREAUTH ")):
+            raise ValueError(f"Invalid IMAP greeting: {greeting!r}")
+
+        stream.sendall(b". CAPABILITY\r\n")
+        cap_reply, lines = get_reply()
+        if not cap_reply.upper().startswith(b"OK "):
+            raise ValueError(f"IMAP CAPABILITY failed: {cap_reply!r}")
+        if not (b"STARTTLS" in capabilities):
+            raise ValueError(f"IMAP STARTTLS CAPABILITY missing")
+
+        stream.sendall(b". STARTTLS\r\n")
+        starttls_reply, _ = get_reply()
+        if not starttls_reply.upper().startswith(b"OK "):
+            raise ValueError(f"IMAP STARTTLS failed: {starttls_reply!r}")
+
+    @staticmethod
+    def starttls_ftp(args: Arguments, stream: BufferedSocket) -> None:
+        def wait_for_reply() -> tuple[int, str]:
+            resp = stream.recv_line(1024)
+            if len(resp) < 4 or not resp[:3].isdigit() or not resp[3] in b" -":
+                RESULT.critical("Invalid FTP response", abort=False)
+                RESULT.message("> " + resp.decode(errors="replace"))
+                raise NagiosAbort()
+
+            code = int(resp[:3])
+            msg = resp[4:].decode(errors="replace").rstrip()
+
+            if resp[3] == 32:  # SP
+                return code, msg
+
+            prefix = resp[:3] + b" "
+            while True:
+                resp = stream.recv_line(1024)
+                if resp.startswith(prefix):
+                    return code, msg
+
+        def wait_for_final_reply() -> tuple[int, str]:
+            while True:
+                code, msg = wait_for_reply()
+                if 100 <= code <= 199:
+                    RESULT.debug(f"Preliminary reply: {code}: {msg}")
+                    continue
+                return code, msg
+
+        conn_code, conn_msg = wait_for_final_reply()
+        if not (200 <= conn_code <= 299):
+            RESULT.critical(f"FTP: Failed establishing connection: {conn_code}: {conn_msg}")
+        RESULT.debug(f"FTP: Connection established: {conn_code}: {conn_msg}")
+
+        stream.sendall(b"AUTH TLS\r\n")
+        tls_code, tls_msg = wait_for_final_reply()
+        if tls_code != 234:
+            RESULT.critical(f"FTP: Failed starting TLS: {tls_code}: {tls_msg}")
+        RESULT.debug(f"FTP: Started TLS: {tls_code}: {tls_msg}")
+
+    @staticmethod
+    def starttls_xmpp(args: Arguments, stream: BufferedSocket) -> None:
+        r_xml_error = re.compile(rb"<(?:[a-zA-Z0-9]+:)?error\b")
+        r_xml_features_end = re.compile(rb"</(?:[a-zA-Z0-9]+:)?features\b[^>]*>|<(?:[a-zA-Z0-9]+:)?features\b[^>]*/>")
+        r_xml_proceed_end = re.compile(rb"</(?:[a-zA-Z0-9]+:)?proceed\b[^>]*>|<(?:[a-zA-Z0-9]+:)?proceed\b[^>]*/>")
+
+        def wait_for(pattern: re.Pattern[bytes]) -> bytes:
+            resp = b""
+            while True:
+                resp += stream.recv(1024)
+                if r_xml_error.search(resp):
+                    RESULT.critical("XMPP stream error", abort=False)
+                    RESULT.message(resp.decode(errors="replace"))
+                    raise NagiosAbort()
+                if pattern.search(resp):
+                    return resp
+
+        xmpp_domain = args.xmpphost or args.host
+        xmpp_proto = "client" if args.protocol == Protocol.XMPP else "server"
+
+        stream.sendall(
+            (
+                "<?xml version='1.0'?>"
+                f"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:{xmpp_proto}' to='{xmpp_domain}' version='1.0'>"
+            ).encode()
+        )
+        wait_for(r_xml_features_end)
+        stream.sendall(b"<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
+        wait_for(r_xml_proceed_end)
+
+    @staticmethod
+    def starttls_ldap(args: Arguments, stream: BufferedSocket) -> None:
+        # https://datatracker.ietf.org/doc/html/rfc4511#section-4.14
+
+        starttls_req = ASN1Object(tag=ASN1Object.SEQUENCE, value=[ # LDAPMessage
+            # messageID MessageID (INTEGER)
+            ASN1Object.from_int(1),
+            # extendedReq ExtendedRequest (APPLICATION [23])
+            ASN1Object(tag=ASN1Object.APPLICATION | 23, value=[
+                # requestName [0] LDAPOID
+                ASN1Object(tag=ASN1Object.CONTEXT_SPECIFIC or 0, value=b"1.3.6.1.4.1.1466.20037")
+            ])
+        ])
+        stream.sendall(starttls_req.encode())
+
+        while True:
+            buffer = stream.peek_further()
+            try:
+                rem, reply = ASN1Object.decode_step(memoryview(buffer))
+            except EOFError:
+                continue  # need more data
+            else:
+                stream.recv(len(buffer) - len(rem))  # remove used data from buffer
+                break
+
+        if (
+            reply.tag != ASN1Object.SEQUENCE or not reply.constructed
+            or len(reply.value) != 2
+            or not isinstance(reply.value[0], ASN1Object)
+            or not isinstance(reply.value[1], ASN1Object)
+            or reply.value[0].tag != ASN1Object.INTEGER or reply.value[0].data_as_int() != 1  # messageID == 1
+            or reply.value[1].tag != (ASN1Object.APPLICATION | 24) or not reply.value[1].constructed or len(reply.value[1].value) < 3 # extendedResp
+            or not isinstance(reply.value[1].value[0], ASN1Object)
+            or not isinstance(reply.value[1].value[2], ASN1Object)
+            or reply.value[1].value[0].constructed  # primitive resultCode
+            or reply.value[1].value[0].tag != ASN1Object.ENUMERATED # resultCode
+            or reply.value[1].value[2].constructed  # primitive diagnosticMessage
+            or reply.value[1].value[2].tag != ASN1Object.OCTET_STRING  # diagnosticMessage
+        ):
+            RESULT.critical("Invalid LDAP reply - STARTTLS not working")
+
+        if reply.value[1].value[0].data_as_int() != 0:
+            # extract message
+            if isinstance(reply.value[1].value[2].value, bytes):
+                msg = reply.value[1].value[2].value.decode(errors="replace")
+                RESULT.critical(f"LDAP reply with non-success resultCode - STARTTLS not supported ({msg!r})")
+            else:
+                RESULT.critical(f"LDAP reply with non-success resultCode and invalid message")
+        # could check reply.value[1].value[3] for CONTEXT-SPECIFIC primitive TAG 10 contain STARTLS OID... but status should be good enough?
+
+    @staticmethod
+    def starttls_sieve(args: Arguments, stream: BufferedSocket) -> None:
+        supports_starttls = False
+        while True:
+            resp = stream.recv_line(1024).rstrip().upper().decode(errors='replace')
+            if resp.startswith("OK"):
+                break
+            RESULT.debug(f"> SIEVE capability: {resp}")
+            supports_starttls = supports_starttls or resp.startswith('"STARTTLS"')
+            if not resp.startswith('"'):
+                RESULT.critical(f"SIEVE: failed establishing connection: {resp}")
+        if not supports_starttls:
+            RESULT.critical(f"SIEVE: missing STARTTLS capability")
+        RESULT.debug(f"> SIEVE: established connection: {resp}")
+        stream.sendall(b"STARTTLS\r\n")
+        resp = stream.recv_line(1024).rstrip().upper().decode(errors='replace')
+        if not resp.startswith("OK"):
+            RESULT.critical(f"SIEVE: failed STARTTLS: {resp}")
+        RESULT.debug(f"> SIEVE: started STARTTLS: {resp}")
+
+    @staticmethod
+    def starttls_postgres(args: Arguments, stream: BufferedSocket) -> None:
+        stream.sendall(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")  # SSL request
+        resp = stream.recv(1)
+        if resp != b"S":
+            RESULT.critical("postgres: SSL request rejected")
+
+    @staticmethod
+    def starttls_mysql(args: Arguments, stream: BufferedSocket) -> None:
+        seq_id = 1
+
+        def recv() -> tuple[int, bytes]:
+            resp_hdr = stream.recv_exact(4)
+            resp_len, = struct.unpack("<L", resp_hdr[:3] + b"\x00")
+            assert resp_len < 2**24 - 1
+            resp_id = resp_hdr[3]
+            return resp_id, stream.recv_exact(resp_len)
+
+        def send(payload: bytes) -> None:
+            nonlocal seq_id
+            assert len(payload) < 2**24 - 1
+            hdr = struct.pack("<L", len(payload))[:3] + struct.pack("<B", seq_id)
+            seq_id = (seq_id + 1) & 0xff
+            stream.sendall(hdr + payload)
+
+        handshake_id, handshake = recv()
+        if handshake_id != 0:
+            RESULT.critical(f"mysql protocol error: expected initial handshake to have sequence id 0, got {handshake_id}")
+
+        if handshake[0] != 10:
+            RESULT.critical(f"mysql protocol not supported (version {handshake[0]}; only version 10 supported)")
+
+        server_desc_raw, rem = handshake[1:].split(b"\x00", maxsplit=1)
+        server_desc = server_desc_raw.decode(errors="replace")
+        RESULT.message(f"> {server_desc}")
+
+        if len(rem) < 20:
+            RESULT.critical(f"mysql protocol error: handshake not long enough (got {handshake!r})")
+        _thread_id, _auth_plug_data, _filler, cap1, _charset, _status_flags, _cap2 = struct.unpack("<LQBHBHH", rem[:20])
+        if 0 == cap1 & 512:
+            RESULT.critical("mysql handshake: (required) Client Protocol 4.1 not supported")
+        if 0 == cap1 & 2048:
+            RESULT.critical("mysql handshake: SSL not supported")
+
+        send(
+            # SSLRequest with Client Protocol 4.1
+            struct.pack(
+                "<LLB",
+                # flags: among others CLIENT_PROTOCOL_41 (512, 0x200) and CLIENT_SSL (2048, 0x800).
+                0x007faa85,
+                1 << 24, # max packet size
+                0x21,  # character set: utf8mb3_general_ci
+            )
+            + bytes(23) # filler
+        )
+        # TLS handshake follows immediately - no "ok" packet before.
+
+    @staticmethod
+    def starttls_tds(args: Arguments, stream: BufferedSocket) -> BufferedSocket:
+        @dataclasses.dataclass(kw_only=True, slots=True)
+        class TDSPacket:
+            pkt_type: int
+            status: int
+            packet_id: int
+            data: bytes
+
+            def encode(self) -> bytes:
+                header = struct.pack(">BBHHBB", self.pkt_type, self.status, len(self.data) + 8, 0, self.packet_id, 0)
+                return header + self.data
+
+            @staticmethod
+            def recv(stream: BufferedSocket) -> TDSPacket:
+                hdr_buf = stream.recv_exact(8)
+                pkt_type, status, plen, _spid, packet_id, _window = struct.unpack(">BBHHBB", hdr_buf)
+                if plen < 8:
+                    RESULT.critical(f"Invalid TDS header with length {plen}")
+                data = stream.recv_exact(plen - 8)
+                return TDSPacket(pkt_type=pkt_type, status=status, packet_id=packet_id, data=data)
+
+            @staticmethod
+            def make_pre_login(
+                *,
+                options: typing.Sequence[tuple[int, bytes]],
+                packet_id: int = 1,
+            ) -> TDSPacket:
+                offset = 5 * len(options) + 1
+                data = b""
+                data_buffer = b""
+                for opt_id, opt_data in options:
+                    data += struct.pack(">BHH", opt_id, offset, len(opt_data))
+                    offset += len(opt_data)
+                    data_buffer += opt_data
+                data += b"\xff"  # end of options marker
+                return TDSPacket(pkt_type=0x12, status=0x01, packet_id=packet_id, data=data + data_buffer)
+
+            def pre_login_opts(self) -> dict[int, bytes]:
+                # request is 0x12, but response is 0x04 (a very generic packet type)
+                pos = 0
+                options = {}
+                while True:
+                    if pos >= len(self.data):
+                        RESULT.critical("Invalid PRELOGIN options, reached end of data")
+                    if self.data[pos] == 0xff:
+                        break
+                    if pos + 5 > len(self.data):
+                        RESULT.critical("Invalid PRELOGIN options, reached end of data")
+                    opt_id, opt_offset, opt_len = struct.unpack(">BHH", self.data[pos:][:5])
+                    if opt_offset + opt_len > len(self.data):
+                        RESULT.critical("Invalid PRELOGIN options, referenced data outside of buffer")
+                    pos += 5
+                    options[opt_id] = self.data[opt_offset:][:opt_len]
+                return options
+
+        pre_login = TDSPacket.make_pre_login(
+            options=[
+                (0x00, struct.pack(">BBHH", 9, 0, 0, 0)),  # VERSION: 9.0 build 0 subbuild 0
+                (0x01, b"\x01"),  # ENCRYPTION: on
+                (0x02, b"\x00"),  # INSTOPT: INSTVALIDITY NUL
+                # (0x03, b"\x00\x00\x00\x00"),  # THREADID
+            ]
+        )
+        stream.sendall(pre_login.encode())
+        resp = TDSPacket.recv(stream)
+        if resp.packet_id != pre_login.packet_id or resp.pkt_type != 0x04:
+            RESULT.critical(f"Invalid PRELOGIN response: {resp}")
+        resp_opts = resp.pre_login_opts()
+        raw_version = resp_opts[0x00]
+        if len(raw_version) != 6:
+            RESULT.critical("PRELOGIN response: Invalid version")
+        version = struct.unpack(">BBHH", raw_version)
+        RESULT.message(f"TDS/MSSQL Server: {version[0]}.{version[1]}, build {version[2]}, subbuild {version[3]}")
+        if resp_opts.get(0x01) != b"\x01":
+            RESULT.critical(f"PRELOGIN response: Encryption not on/supported (got {resp_opts.get(0x01)!r})")
+
+        class TDSWrapper(AbstractSocket):
+            def __init__(self, stream: BufferedSocket) -> None:
+                super().__init__()
+                self._stream = stream
+                self._buffer = b""
+                self._packet_id = 0x01
+
+            def recv(self, bufsize: int, /, flags: int = 0) -> bytes:
+                if self._buffer:
+                    data, self._buffer = self._buffer, b""
+                    return data
+                pkt = TDSPacket.recv(self._stream)
+                if pkt.pkt_type != 0x12:
+                    RESULT.critical("TLS stream must be wrapped in PRELOGIN packets")
+                if len(pkt.data) > bufsize:
+                    data, self._buffer = pkt.data[:bufsize], pkt.data[bufsize:]
+                    return data
+                return pkt.data
+
+            def sendall(self, data: bytes, /, flags: int = 0) -> None:
+                self._packet_id = (self._packet_id + 0x01) & 0xff
+                self._stream.sendall(TDSPacket(pkt_type=0x12, status=0x01, packet_id=self._packet_id, data=data).encode(), flags=flags)
+
+            def close(self) -> None:
+                self._stream.close()
+
+            def shutdown(self, how: int) -> None:
+                self._stream.shutdown(how)
+
+        return BufferedSocket(TDSWrapper(stream))
+
+    @staticmethod
+    def _unsupported_starttls(args: Arguments, stream: BufferedSocket) -> None:
+        raise RuntimeError(f"Unsupported STARTTLS protocol {args.protocol}")
+
+    def starttls(self) -> typing.Callable[[Arguments, BufferedSocket], BufferedSocket | None] | None:
+        match self:
+            case Protocol.SMTP:
+                return self.starttls_smtp
+            case Protocol.POP3:
+                return self.starttls_pop3
+            case Protocol.FTP:
+                return self.starttls_ftp
+            case Protocol.LDAP:
+                return self.starttls_ldap
+            case Protocol.IMAP:
+                return self.starttls_imap
+            case Protocol.POSTGRES:
+                return self.starttls_postgres
+            case Protocol.SIEVE:
+                return self.starttls_sieve
+            case Protocol.MYSQL:
+                return self.starttls_mysql
+            case Protocol.XMPP:
+                return self.starttls_xmpp
+            case Protocol.XMPP_SERVER:
+                return self.starttls_xmpp
+            case Protocol.TDS:
+                return self.starttls_tds
+        return None
+
+    @staticmethod
+    def starttls_protocols() -> list[Protocol]:
+        return [
+            protocol
+            for protocol in Protocol
+            if protocol.starttls()
+        ]
+
+    def default_port(self) -> int:
+        match self:
+            case Protocol.SMTP:
+                return 25
+            case Protocol.SMTPS:
+                return 465
+            case Protocol.POP3:
+                return 110
+            case Protocol.DNS:
+                return 853
+            case Protocol.FTP:
+                return 21
+            case Protocol.POP3S:
+                return 995
+            case Protocol.LDAP:
+                return 389
+            case Protocol.LDAPS:
+                return 636
+            case Protocol.IMAP:
+                return 143
+            case Protocol.IMAPS:
+                return 993
+            case Protocol.POSTGRES:
+                return 5432
+            case Protocol.SIEVE:
+                return 4190
+            case Protocol.HTTPS | Protocol.H2 | Protocol.H3:
+                return 443
+            case Protocol.MQTTS:
+                return 8883
+            case Protocol.MYSQL:
+                return 3306
+            case Protocol.SIPS:
+                return 5061
+            case Protocol.XMPP:
+                return 5222
+            case Protocol.XMPP_SERVER:
+                return 5269
+            case Protocol.TDS:
+                return 1433
+        raise ValueError(f"Unknown protocol {self}")
+
+
+class Grade(enum.IntEnum):
+    A_PLUS = 85
+    A = 80
+    A_MINUS = 75
+    B = 65
+    C = 50
+    D = 35
+    E = 20
+    F = 0
+
+    @staticmethod
+    def from_str(text: str) -> Grade:
+        grade = _GRADE_BY_LC_NAMES.get(text.lower(), None)
+        if grade is None:
+            raise KeyError(f"Unknown grade {text!r}")
+        return grade
+
+    def __str__(self) -> str:
+        match self:
+            case Grade.A_PLUS:
+                return "A+"
+            case Grade.A:
+                return "A"
+            case Grade.A_MINUS:
+                return "A-"
+            case Grade.B:
+                return "B"
+            case Grade.C:
+                return "C"
+            case Grade.D:
+                return "D"
+            case Grade.E:
+                return "E"
+            case Grade.F:
+                return "F"
+        raise ValueError(f"Invalid grade {self!r}")
+
+
+# SSL Labs or nmap grades
+_GRADE_BY_LC_NAMES = {
+    "a+": Grade.A_PLUS,
+    "a": Grade.A,
+    "strong": Grade.A,
+    "a-": Grade.A_MINUS,
+    "b": Grade.B,
+    "c": Grade.C,
+    "weak": Grade.C,
+    "d": Grade.D,
+    "e": Grade.E,
+    "f": Grade.F,
+    # No trust: value not in documentation
+    "t": Grade.F,
+    "unknown": Grade.F,
+    # Certificate name mismatch: value not in documentation
+    "m": Grade.F,
+}
+
+
+class VerifyDane(enum.StrEnum):
+    ANY = "any"  # allow any DANE configuration
+    # three digits:
+    # * TA=2, EE=3
+    # * SPKI=1, CERT=0
+    # * SHA2-256=1, SHA2-512=2
+    TA_SPKI_SHA2_256 = "211"
+    EE_CERT_SHA2_256 = "301"
+    EE_CERT_SHA2_512 = "302"
+    EE_SPKI_SHA2_256 = "311"
+    EE_SPKI_SHA2_512 = "312"
+
+    @staticmethod
+    def from_str(name: str) -> VerifyDane:
+        return VerifyDane(name)
+
+
+class AbstractSocket(typing.Protocol):
+    def recv(self, bufsize: int, /, flags: int = 0) -> bytes:
+        ...
+
+    def sendall(self, data: bytes, /, flags: int = 0) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+    def shutdown(self, how: int) -> None:
+        ...
+
+
+class BufferedSocket:
+    def __init__(self, stream: AbstractSocket, /) -> None:
+        self._socket = stream
+        self._buffer = bytearray()
+        self._got_eof = False
+
+    @staticmethod
+    def create_connection(host: str, port: int) -> BufferedSocket:
+        stream = socket.create_connection((host, port))
+        return BufferedSocket(stream)
+
+    def _fill_buffer(self) -> None:
+        if self._got_eof:
+            raise EOFError()
+        try:
+            data = self._socket.recv(1024)
+            if len(data) == 0:
+                raise EOFError()
+            self._buffer += data
+        except EOFError:
+            self._got_eof = True
+            raise
+
+    def _take_buffer(self, bufsize: int = -1) -> bytes:
+        if bufsize < 0 or bufsize >= len(self._buffer):
+            result = bytes(self._buffer)
+            self._buffer.clear()
+        else:
+            result = bytes(self._buffer[:bufsize])
+            self._buffer = self._buffer[bufsize:]
+        return result
+
+    def peek(self, lookahead: int) -> bytes:
+        # returned data is at least `lookahead` bytes long, fail on EOF
+        while len(self._buffer) < lookahead:
+            self._fill_buffer()
+        return bytes(self._buffer)
+
+    def peek_further(self) -> bytes:
+        # get at least one additional byte, fail on EOF
+        self._fill_buffer()
+        return bytes(self._buffer)
+
+    def recv_line(self, bufsize: int, /, *, separator: bytes = b'\n') -> bytes:
+        # returns (non-empty) final line without separator on EOF, otherwise separator is included
+        while True:
+            try:
+                pos = self._buffer.index(separator)
+            except ValueError:
+                pass
+            else:
+                return self._take_buffer(pos + len(separator))
+            # separator not found: need more data
+            if len(self._buffer) >= bufsize:
+                raise ValueError(f"Couldn't find separator in first {bufsize} of received data")
+            try:
+                self._fill_buffer()
+            except EOFError:
+                # ignore EOF if we have (non-empty) "partial" line (without separator at end)
+                if self._buffer:
+                    return self._take_buffer()
+                raise
+
+    def recv(self, bufsize: int, /, flags: int = 0) -> bytes:
+        if self._buffer:
+            return self._take_buffer(bufsize)
+        if self._got_eof:
+            return b""
+        data = self._socket.recv(bufsize, flags)
+        if len(data) == 0:
+            self._got_eof = True
+        return data
+
+    def recv_exact(self, size: int) -> bytes:
+        data = b""
+        while len(data) < size:
+            data += self.recv(size - len(data))
+        return data
+
+    def sendall(self, data: bytes, /, flags: int = 0) -> None:
+        self._socket.sendall(data, flags)
+
+    def close(self) -> None:
+        self._socket.close()
+
+    def shutdown(self, how: int) -> None:
+        self._socket.shutdown(how)
+
+
+_PCTRTT: typing.TypeAlias = tuple[tuple[str, str], ...]
+_PCTRTTT: typing.TypeAlias = tuple[_PCTRTT, ...]
+_PeerCertRetDictType: typing.TypeAlias = dict[str, str | _PCTRTTT | _PCTRTT]
+_PeerCertRetType: typing.TypeAlias = _PeerCertRetDictType | bytes | None
+
+
+class GenericSSLClient:
+    def __init__(
+        self,
+        *,
+        context: OpenSSL.SSL.Context,
+        stream: AbstractSocket,
+        server_hostname: str | None = None,  # SNI
+        session: OpenSSL.SSL.Session | None = None,
+    ) -> None:
+        self._stream = stream
+        self._outgoing_closed = False
+        self._incoming_closed = False
+        self._incoming_buf = b""
+        self._ssl = OpenSSL.SSL.Connection(context)
+        if server_hostname:
+            self._ssl.set_tlsext_host_name(server_hostname.encode('idna'))
+        if session:
+            self._ssl.set_session(session)
+        self._ssl.set_connect_state()
+
+    def _flush_outgoing(self) -> None:
+        while True:
+            if not self._outgoing_closed:
+                try:
+                    data = self._ssl.bio_read(4096)
+                    self._stream.sendall(data)
+                except OpenSSL.SSL.WantReadError:
+                    return  # nothing pending
+            else:
+                # clear buffer
+                self._ssl.bio_read(4096)
+
+    def _flush_incoming(self) -> None:
+        while self._incoming_buf:
+            try:
+                written = self._ssl.bio_write(self._incoming_buf)
+            except OpenSSL.SSL.WantReadError:
+                return
+            self._incoming_buf = self._incoming_buf[written:]
+
+    def _repeat_with_bio[T](self, callable: typing.Callable[[], T], /) -> T:
+        while True:
+            want_read = False
+            try:
+                result = callable()
+                break
+            except OpenSSL.SSL.WantWriteError:
+                # we always flush outgoing
+                # retry in next iteration
+                pass
+            except OpenSSL.SSL.WantReadError:
+                want_read = True
+
+            self._flush_outgoing()
+            if want_read:
+                if self._incoming_closed:
+                    raise RuntimeError("caught SSLWantReadError but stream already closed")
+                if self._incoming_buf:
+                    self._flush_incoming()
+                    continue
+                try:
+                    self._incoming_buf = self._stream.recv(4096)
+                    if not self._incoming_buf:
+                        raise EOFError()
+                except EOFError:
+                    self._incoming_closed = True
+                    self._ssl.bio_shutdown()
+                else:
+                    self._flush_incoming()
+
+        self._flush_outgoing()
+
+        return result
+
+    @property
+    def context(self) -> OpenSSL.SSL.Context:
+        return self._ssl.get_context()
+
+    @property
+    def session(self) -> OpenSSL.SSL.Session | None:
+        return self._ssl.get_session()
+
+    def cipher(self) -> tuple[str, str, int] | None:
+        name = self._ssl.get_cipher_name()
+        version = self._ssl.get_cipher_version()
+        bits = self._ssl.get_cipher_bits()
+        if name is None or version is None or bits is None:
+            return None
+        return (name, version, bits)
+
+    def pending(self) -> int:
+        return self._ssl.pending()
+
+    def renegotiate(self) -> bool:
+        return self._ssl.renegotiate()
+
+    def do_handshake(self) -> None:
+        try:
+            return self._repeat_with_bio(lambda: self._ssl.do_handshake())
+        except OpenSSL.SSL.Error as exc:
+            reasons = ", ".join(reason
+                for _lib, _function, reason in exc.args[0]
+            )
+            RESULT.critical(
+                f"Failed TLS handshake: {type(exc).__name__}: {reasons}",
+                abort=not self.get_peer_cert_chain(),
+            )
+
+    def version(self) -> str:
+        return self._ssl.get_protocol_version_name()
+
+    def get_peer_cert_chain(self) -> list[cryptography.x509.Certificate] | None:
+        certs = self._ssl.get_peer_cert_chain()
+        if certs is None:
+            return None
+        return [cert.to_cryptography() for cert in certs]
+
+    # IO
+
+    def recv(self, bufsize: int, /, flags: int = 0) -> bytes:
+        return self._repeat_with_bio(lambda: self._ssl.recv(bufsize))
+
+    def sendall(self, data: bytes | memoryview | bytearray, /, flags: int = 0) -> None:
+        self._repeat_with_bio(lambda: self._ssl.sendall(data))
+
+    def close(self) -> None:
+        self._ssl.write_eof()
+        self._outgoing_closed = True
+        self._flush_outgoing()
+        self._stream.close()
+
+    def shutdown(self, how: int) -> None:
+        self._repeat_with_bio(lambda: self._ssl.unwrap())
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class Option:
+    help: str
+    action: str
+    converter: typing.Callable[[str], typing.Any] | None
+    required: bool
+    aliases: tuple[str, ...]
+    metavar: str
+
+    @staticmethod
+    def _make[T](
+        *,
+        default: T | dataclasses._MISSING_TYPE,
+        default_factory: typing.Callable[[], T] | dataclasses._MISSING_TYPE = dataclasses.MISSING,
+        help: str,
+        action: str = "store",
+        converter: typing.Callable[[str], typing.Any] | None = None,
+        required: bool = False,
+        metavar: str = "",
+        aliases: typing.Sequence[str],
+    ) -> T:
+        metadata = {id(Option): Option(
+            help=help,
+            action=action,
+            converter=converter,
+            required=required,
+            aliases=tuple(aliases),
+            metavar=metavar,
+        )}
+        return dataclasses.field(
+            default=default,
+            default_factory=default_factory,  # type: ignore
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def from_str[T](
+        *,
+        default: T,
+        converter: typing.Callable[[str], typing.Any],
+        aliases: typing.Sequence[str] = (),
+        metavar: str = "",
+        help: str,
+    ) -> T:
+        return Option._make(
+            default=default,
+            help=help,
+            converter=converter,
+            required=False,
+            metavar=metavar,
+            aliases=tuple(aliases),
+        )
+
+    @staticmethod
+    def simple_str(
+        *,
+        default: str = "",
+        required: bool = False,
+        aliases: typing.Sequence[str] = (),
+        metavar: str = "",
+        help: str,
+    ) -> str:
+        return Option._make(
+            default=default,
+            help=help,
+            converter=str,
+            required=required,
+            metavar=metavar,
+            aliases=tuple(aliases),
+        )
+
+    @staticmethod
+    def multi_str(
+        *,
+        aliases: typing.Sequence[str] = (),
+        metavar: str = "",
+        help: str,
+    ) -> list[str]:
+        return Option._make(
+            default=dataclasses.MISSING,
+            default_factory=list,
+            help=help,
+            action="append",
+            required=False,
+            metavar=metavar,
+            aliases=tuple(aliases),
+        )
+
+    @staticmethod
+    def flag(
+        *,
+        default: bool = False,
+        aliases: typing.Sequence[str] = (),
+        help: str,
+    ) -> bool:
+        return Option._make(
+            default=default,
+            help=help,
+            converter=None,
+            action="store_false" if default else "store_true",
+            aliases=tuple(aliases),
+        )
+
+    @staticmethod
+    def count(
+        *,
+        aliases: typing.Sequence[str] = (),
+        help: str,
+    ) -> int:
+        return Option._make(
+            default=0,
+            help=help,
+            converter=None,
+            action="count",
+            aliases=tuple(aliases),
+        )
+
+
+@dataclasses.dataclass
+class Arguments:
+    @staticmethod
+    def _add_opt_from_field(parser: argparse.ArgumentParser, field: dataclasses.Field) -> None:
+        option = field.metadata[id(Option)]
+        assert isinstance(option, Option)
+        kwargs: dict[str, typing.Any] = dict(
+            action=option.action,
+            dest=field.name,
+            required=option.required,
+            help=option.help,
+        )
+        if option.converter:
+            kwargs['type'] = option.converter
+        if not field.default is None and not field.default is dataclasses.MISSING:
+            if isinstance(field.default, (bool, int)):
+                kwargs['default'] = field.default
+            else:
+                kwargs['default'] = str(field.default)
+        if option.metavar:
+            kwargs["metavar"] = option.metavar
+        if option.aliases and not option.aliases[0]:
+            flags = option.aliases[1:]
+        else:
+            flags = (
+                f"--{field.name.strip('_').replace('_', '-')}",
+                *option.aliases,
+            )
+        if field.name.startswith('_'):
+            kwargs["help"] = argparse.SUPPRESS
+        parser.add_argument(
+            *flags,
+            **kwargs,
+        )
+
+    @staticmethod
+    def parse_args():
+        parser = argparse.ArgumentParser(allow_abbrev=False)
+        for field in dataclasses.fields(Arguments):
+            if field.name == "host":
+                # host can also be specified without leading "-H"
+                host_group = parser.add_mutually_exclusive_group()
+                host_group.add_argument("hostarg", metavar="HOST", nargs='?', help="Please specify the server using --host/-H instead")
+                Arguments._add_opt_from_field(host_group, field)
+            else:
+                Arguments._add_opt_from_field(parser, field)
+
+        try:
+            args = parser.parse_args()
+        except SystemExit:
+            import shlex
+            print("Called as: " + shlex.join(sys.argv))
+            raise
+
+        hostarg = args.__dict__.pop("hostarg", None)
+        if not hostarg is None:
+            assert not args.host
+            args.host = hostarg
+        if not args.host:
+            RESULT.critical("Missing --host argument")
+        return Arguments(**args.__dict__)
+
+    cache_dir: str = Option.simple_str(help=(
+        f"Cache/state base directory to store CRLs in (default: {DEFAULT_NAGIOS_STATE_DIR}), "
+        "uses 'check_tls_service' subdirectory)"
+    ))
+
+    protocol: Protocol = Option.from_str(
+        default=Protocol.HTTPS,
+        converter=Protocol.from_str,
+        aliases=["-P"],
+        help=f"Use the specified protocol (default: https, available: {', '.join(Protocol._value2member_map_)})."
+        f" The protocols {', '.join(p.value for p in Protocol.starttls_protocols())} use a protocol specific StartTLS method to initiate TLS.",
+    )
+    file: str = Option.simple_str(aliases=["-f"], help=(
+        "Local file path or URI."
+        # TODO: support CRL / KeyStore files?? For now only simple certificates.
+        # "With -f you can not only pass a x509 certificate file but also a certificate revocation list (CRL) to check the validity period or a Java KeyStore file"
+    ))
+    host: str = Option.simple_str(
+        aliases=["-H"],
+        help="Server to check",
+    )
+    # noauth: bool = Option.flag(
+    #     aliases=["-A"],
+    #     help="Ignore authority warnings (expiration only)",
+    # )
+    # all: bool = Option.flag(help="Enable all the possible optional checks at the maximum level")
+    # all_local: bool = Option.flag(help="Enable all the possible optional checks at the maximum level (without SSL-Labs)")
+    allow_empty_san: bool = Option.flag(help="Allow certificates without Subject Alternative Names (SANs)")
+    clientcert: str = Option.simple_str(aliases=["-C"], help="Use client certificate to authenticate", metavar="PATH")
+    critical: float = Option.from_str(
+        default=15.0,
+        converter=float,
+        aliases=["-c"],
+        help="Minimum number of days a certificate has to be valid to issue a critical status. Can be a floating point number, e.g., 0.5. Default: 15",
+    )
+    check_chain: bool = Option.flag(help="The certificate chain cannot contain double or root certificates.")
+    # check_ciphers: Grade | None = Option.from_str(
+    #     default=None,
+    #     converter=Grade.from_str,
+    #     help=f"Check the offered ciphers are at least of given grade ({', '.join(str(g) for g in Grade)})",
+    #     metavar="GRADE",
+    # )
+    # check_ciphers_warnings: bool = Option.flag(help="Critical if nmap reports a warning for an offered cipher.")
+    # check_http_headers: bool = Option.flag(help="Check the HTTP headers for best practices.")
+    # check_ssl_labs_warn: Grade | None = Option.from_str(
+    #     default=None,
+    #     converter=Grade.from_str,
+    #     help=f"SSL Labs grade on which to warn ({', '.join(str(g) for g in Grade)})",
+    #     metavar="GRADE",
+    # )
+    # clientpass: str = Option.simple_str(metavar="PHRASE", help="Set passphrase for client certificate.")
+    # configuration: str = Option.simple_str(metavar="file", help="Read options from the specified file.")
+    # crl: bool = Option.flag(help="Check revocation via CRL (requires --rootcert-file).")
+    _curl_bin: str = Option.simple_str(metavar="PATH", help="Path of the curl binary to be used.")
+    # custom_http_header: str = Option.simple_str(metavar="HEADER", help="Custom HTTP header sent when getting the cert example: 'X-Check-Ssl-Cert: Foobar=1'.")
+    # default_format: str = Option.flag(help="Print the default output format and exit.")
+    # dane: VerifyDane | None = Option.from_str(
+    #     # TODO: accept "--dane" without parameter as "any"
+    #     default=None,
+    #     converter=VerifyDane.from_str,
+    #     metavar="CODE",
+    #     help=f"Verify that a valid DANE TLSA record exists; choices: {','.join(f'{vd.name}={vd.value}' for vd in VerifyDane)}",
+    # )
+    _date: str = Option.simple_str(metavar="PATH", help="Path of the date binary to be used.")
+    debug: int = Option.count(aliases=["-d"], help="Produce debugging output (can be specified more than once).")
+    # debug_cert: bool = Option.flag(help="Store the retrieved certificates in the current directory.")
+    # debug_headers: bool = Option.flag(help="Store the retrieved HTLM headers in the headers.txt file.")
+    # debug_file: str = Option.simple_str(metavar="FILE", help="Write the debug messages to file.")
+    # debug_time: bool = Option.flag(help="Write timing information in the debugging output.")
+    _dig_bin: str = Option.simple_str(metavar="path", help="Path of the dig binary to be used")
+    # do_not_resolve: bool = Option.flag(help="Do not check if the host can be resolved")
+    # dtls: bool = Option.flag(help="Use the DTLS protocol")
+    # dtls1: bool = Option.flag(help="Use the DTLS protocol 1.0")
+    # dtls1_2: bool = Option.flag(aliases=["", "--dtls1_2"], help="Use the DTLS protocol 1.2")
+    # email: str = Option.simple_str(aliases=["-e"], metavar="address", help="Pattern to match the email address contained in the certificate")
+    # ecdsa: bool = Option.flag(help="Signature algorithm selection: force ECDSA certificate")
+    # element: str = Option.simple_str(metavar="number", help="Check up to the N cert element from the beginning of the chain")
+    _file_bin: str = Option.simple_str(metavar="path", help="Path of the file binary to be used")
+    # fingerprint: str = Option.simple_str(metavar="hash", help="Pattern to match the fingerprint")
+    # fingerprint_alg: str = Option.simple_str(metavar="algorithm", help="Algorithm for fingerprint. Default sha1")
+    # first_element_only: bool = Option.flag(help="Verify just the first cert element, not the whole chain")
+    # force_dconv_date: bool = Option.flag(help="Force the usage of dconv for date computations")
+    # force_perl_date: bool = Option.flag(help="Force the usage of Perl for date computations")
+    # format: str = Option.simple_str(metavar="FORMAT", help=(
+    #     "Format output template on success, for example: "
+    #     "'%SHORTNAME% OK %CN% from %CA_ISSUER_MATCHED%'. list of possible variables: %CA_ISSUER_MATCHED%, %CHECKEDNAMES%, %CN%, %DATE%, "
+    #     "%DAYS_VALID%, %DYSPLAY_CN%, %HOST%, %OCSP_EXPIRES_IN_HOURS%, %OPENSSL_COMMAND%, %PORT%, %SELFSIGNEDCERT%, %SHORTNAME%, %SIGALGO%, "
+    #     "%SSL_LABS_HOST_GRADE%. See --default-format for the default."
+    # ).replace("%", "%%"))
+    grep_bin: str = Option.simple_str(metavar="path", help="Path of the grep binary to be used")
+    # http_headers_path: str = Option.simple_str(aliases=["--require-security-headers-path"], metavar="path", help="The path to be used to fetch HTTP headers")
+    # http_use_get: bool = Option.flag(help="Use GET instead of HEAD (default) for the HTTP related checks")
+    # issuer: str = Option.simple_str(aliases=["-i"], metavar="issuer", help="Pattern to match the issuer of the certificate")
+    ignore_altnames: bool = Option.flag(help="Ignore alternative names when matching pattern specified in -n (or the host name)")
+    # # TODO: accept --ignore-connection-problems without parameter
+    # ignore_connection_problems: str = Option.simple_str(metavar="[state]", help="In case of connection problems returns OK or the optional state")
+    # ignore_exp: bool = Option.flag(help="Ignore expiration date")
+    # ignore_http_headers: bool = Option.flag(help="Ignore checks on HTTP headers with --all and --all-local")
+    ignore_host_cn: bool = Option.flag(help="Do not complain if the CN does not match the host name")
+    # ignore_incomplete_chain: bool = Option.flag(help="Do not check chain integrity")
+    ignore_maximum_validity: bool = Option.flag(help="Ignore the certificate maximum validity")
+    # ignore_ocsp: bool = Option.flag(help="Do not check revocation with OCSP")
+    # ignore_ocsp_errors: bool = Option.flag(help="Continue if the OCSP status cannot be checked")
+    # ignore_ocsp_timeout: bool = Option.flag(help="Ignore OCSP result when timeout occurs while checking")
+    ignore_sct: bool = Option.flag(help="Do not check for signed certificate timestamps (SCT)")
+    # ignore_sig_alg: bool = Option.flag(help="Do not check if the certificate was signed with SHA1 or MD5")
+    # ignore_ssl_labs_cache: bool = Option.flag(help="Force a new check by SSL Labs (see -L)")
+    # ignore_ssl_labs_errors: bool = Option.flag(help="Ignore errors if SSL Labs is not accessible or times out")
+    # ignore_tls_renegotiation: bool = Option.flag(help="Ignore the TLS renegotiation check")
+    # ignore_unexpected_eof: bool = Option.flag(help="Ignore unclean TLS shutdowns")
+    # inetproto: int = Option.from_str(default=0, converter=int, metavar="protocol", help="Force IP version 4 or 6")
+    # info: bool = Option.flag(help="Print certificate information")
+    # init_host_cache: bool = Option.flag(help="Initialize the host cache")
+    # issuer_cert_cache: str = Option.simple_str(metavar="dir", help="Directory where to store issuer certificates cache")
+    # jks_alias: str = Option.simple_str(metavar="alias", help="Alias name of the Java KeyStore entry (requires --file)")
+    clientkey: str = Option.simple_str(aliases=["-K"], metavar="path", help="Use client certificate key to authenticate")
+    # check_ssl_labs: str = Option.simple_str(aliases=["-L"], metavar="grade", help="SSL Labs assessment (please check https://www.ssllabs.com/about/terms.html)")
+    # long_output: str = Option.simple_str(metavar="list", help="Append the specified comma separated (no spaces) list of attributes to the plugin output on additional lines.  Valid attributes are: enddate, startdate, subject, issuer, modulus, serial, hash, email, ocsp_uri and fingerprint.  'all' will include all the available attributes.")
+    match: list[str] = Option.multi_str(aliases=["-m", "--cn", "-n"], help="Pattern to match the CN or AltName (can be specified multiple times)")
+    # # TODO: accept --maximum-validity without parameter with "default" 397
+    maximum_validity: int = Option.from_str(default=-1, converter=int, metavar="[days]", help="The maximum validity of the certificate must not exceed 'days' (default 397). This check is automatic for HTTPS")
+    _nmap_bin: str = Option.simple_str(metavar="path", help="Path of the nmap binary to be used")
+    # nmap_with_proxy: bool = Option.flag(help="Allow nmap to be used with a proxy")
+    # no_perf: bool = Option.flag(help="Do not show performance data")
+    # no_proxy: bool = Option.flag(help="Ignore the http_proxy and https_proxy environment variables")
+    # no_proxy_curl: bool = Option.flag(help="Ignore the http_proxy and https_proxy environment variables for curl")
+    # no_proxy_s_client: bool = Option.flag(aliases=["", "--no-proxy-s_client"], help="Ignore the http_proxy and https_proxy environment variables for openssl s_client")
+    no_ssl2: bool = Option.flag(aliases=["--no_ssl2"], help="Disable SSL version 2")
+    no_ssl3: bool = Option.flag(aliases=["--no_ssl3"], help="Disable SSL version 3")
+    no_tls1: bool = Option.flag(aliases=["--no_tls1"], help="Disable TLS version 1")
+    no_tls1_1: bool = Option.flag(aliases=["--no-tls1_1"], help="Disable TLS version 1.1")
+    no_tls1_2: bool = Option.flag(aliases=["--no-tls1_2"], help="Disable TLS version 1.2")
+    no_tls1_3: bool = Option.flag(aliases=["--no-tls1_3"], help="Disable TLS version 1.3")
+    # not_issued_by: str = Option.simple_str(metavar="issuer", help="Check that the issuer of the certificate does not match the given pattern")
+    # not_valid_longer_than: int = Option.from_str(default=-1, converter=int, metavar="days", help="Critical if the certificate validity is longer than the specified period")
+    # org: str = Option.simple_str(aliases=["-o"], metavar="org", help="Pattern to match the organization of the certificate")
+    # ocsp_critical: float = Option.from_str(default=0.0, converter=float, metavar="hours", help="Minimum number of hours an OCSP response has to be valid to issue a critical status")
+    # ocsp_warning: float = Option.from_str(default=0.0, converter=float, metavar="hours", help="Minimum number of hours an OCSP response has to be valid to issue a warning status")
+    _openssl: str = Option.simple_str(metavar="path", help="Path of the openssl binary to be used")
+    _path: str = Option.simple_str(metavar="path", help="Set the PATH variable to 'path'")
+    port: int = Option.from_str(
+        default=0,
+        converter=int,
+        aliases=["-p"],
+        help="TCP port (default depending on protocol)",
+    )
+    # precision: int = Option.from_str(default=-1, converter=int, metavar="digits", help="Number of decimal places for durations: defaults to 0 if critical or warning are integers, 2 otherwise")
+    # password: str = Option.simple_str(metavar="source", help="Password source for a local certificate, see the PASS PHRASE ARGUMENTS section openssl(1)")
+    # prometheus: bool = Option.flag(help="Generate Prometheus/OpenMetrics output")
+    # proxy: str = Option.simple_str(metavar="proxy", help="Set http_proxy and the s_client -proxy option")
+    # _python_bin: str = Option.simple_str(metavar="path", help="Path of the python binary to be used")
+    # quic: bool = Option.flag(help="Use QUIC")
+    # quiet: bool = Option.flag(aliases=["-q"], help="Do not produce any output")
+    rootcert: str = Option.simple_str(aliases=["-r"], metavar="path", help="Root certificate or directory to be used for certificate validation")
+    # # TODO: accept --require-client-cert without parameter
+    # require_client_cert: str = Option.simple_str(metavar="[list]", help="The server must accept a client certificate. 'list' is an optional comma separated list of expected client certificate CAs")
+    # require_dnssec: bool = Option.flag(help="Require DNSSEC")
+    # require_http_header: list[str] = Option.multi_str(aliases=["--require-security-header"], metavar="header", help="Require the specified HTTP header (e.g., X-Frame-Options)")
+    # require_no_http_header: list[str] = Option.multi_str(metavar="header", help="Require the absence of the specified HTTP header (e.g., X-Powered-By)")
+    # require_no_ssl2: bool = Option.flag(help="Critical if SSL version 2 is offered")
+    # require_no_ssl3: bool = Option.flag(help="Critical if SSL version 3 is offered")
+    # require_no_tls1: bool = Option.flag(help="Critical if TLS 1 is offered")
+    # require_no_tls1_1: bool = Option.flag(aliases=["", "--require-no-tls1_1"], help="Critical if TLS 1.1 is offered")
+    # require_ocsp_stapling: bool = Option.flag(help="Require OCSP stapling")
+    # require_purpose: str = Option.simple_str(metavar="usage", help="Require the specified key usage (can be specified more then once)")
+    # require_purpose_critical: bool = Option.flag(help="The key usage must be critical")
+    # # TODO: accept --resolver-over-http without parameter
+    # resolve_over_http: str = Option.simple_str(metavar="[server]", help="Resolve the host over HTTP using Google or the specified server")
+    # resolve: str = Option.simple_str(metavar="ip", help="Provide a custom IP address for the specified host")
+    rootcert_dir: str = Option.simple_str(metavar="path", help="Root directory to be used for certificate validation")
+    rootcert_file: str = Option.simple_str(metavar="path", help="Root certificate to be used for certificate validation")
+    # rsa: bool = Option.flag(help="Signature algorithm selection: force RSA certificate")
+    # security_level: int = Option.from_str(default=-1, converter=int, metavar="number", help="Set the security level to specified value. See SSL_CTX_set_security_level(3) for a description of what each level means")
+    # selfsigned: bool = Option.flag(aliases=["-s"], help="Allow self-signed certificates")
+    # serial: str = Option.simple_str(metavar="serialnum", help="Pattern to match the serial number")
+    # skip_element: list[str] = Option.multi_str(metavar="number", help="Skip checks on the Nth cert element (can be specified multiple times)")
+    sni: str = Option.simple_str(
+        help="Set the TLS SNI (Server Name Indication) extension in the ClientHello message to 'name'",
+        metavar="name",
+    )
+    # ssl2: bool = Option.flag(help="Force SSL version 2")
+    # ssl3: bool = Option.flag(help="Force SSL version 3")
+    # timeout: int = Option.from_str(aliases=["-t"], default=120, converter=int, metavar="seconds", help="Timeout after the specified time (defaults to 120 seconds)")
+    # temp: str = Option.simple_str(metavar="dir", help="Directory where to store the temporary files")
+    # terse: bool = Option.flag(help="Terse output")
+    # tls1: bool = Option.flag(help="Force TLS version 1")
+    # tls1_1: bool = Option.flag(aliases=["", "--tls1_1"], help="Force TLS version 1.1")
+    # tls1_2: bool = Option.flag(aliases=["", "--tls1_2"], help="Force TLS version 1.2")
+    # tls1_3: bool = Option.flag(aliases=["", "--tls1_3"], help="Force TLS version 1.3")
+    # url: str = Option.simple_str(aliases=["-u"], metavar="string", help="HTTP request URL")
+    # user_agent: str = Option.simple_str(metavar="string", help="User agent that shall be used for HTTPS connections")
+    # verbose: int = Option.count(aliases=["-v"], help="Verbose output (can be specified more than once)")
+    # version: bool = Option.flag(aliases=["-V"], help="Version")
+    warning: float = Option.from_str(
+        default=20.0,
+        converter=float,
+        aliases=["-w", "--days"],
+        help="Minimum number of days a certificate has to be valid to issue a warning status. Can be a floating point number, e.g., 0.5. Default: 20",
+    )
+    xmpphost: str = Option.simple_str(metavar="NAME", help="Specify the host for the 'to' attribute of the stream element.")
+    ipv4: bool = Option.flag(help="Force IPv4", aliases=["", "-4"])
+    ipv6: bool = Option.flag(help="Force IPv6", aliases=["", "-6"])
+
+    # deprecated options:
+    _altnames: bool = Option.flag(help="Match the pattern specified in -n with alternate names too") # done by default
+    # curl_user_agent: str = Option.simple_str(help="User agent that curl shall use to obtain the issuer cert")
+    _host_cn: bool = Option.flag(aliases=["-N"], help="Match CN with the host name") # done by default?
+    _ocsp: bool = Option.flag(help="Check revocation via OCSP") # done by default
+    # require_hsts: bool = Option.flag(help="Require HTTP Strict Transport Security (deprecated: use --require-http-header strict-transport-security")
+    _require_san: bool = Option.flag(help="Require the presence of a Subject Alternative Name extension") # done by default
+    # require_security_headers: bool = Option.flag(help="Require all the HTTP security headers: Content-Security-Policy, Permissions-Policy, Referrer-Policy, strict-transport-security, X-Content-Type-Options, X-Frame-Options")
+    # require_x_frame_options: str = Option.simple_str(metavar="[path]", help="Require the presence of the X-Frame-Options HTTP header. 'path' is the optional path to be used in the URL to check for the header (deprecated use --require-http-header X-Frame-Options and --require-http-headers-path path)")
+    # ssl: str = Option.simple_str(aliases=["-S"], metavar="version", help="Force SSL version (2,3) (see: --ssl2 or --ssl3)")
+
+    @property
+    def actual_port(self) -> int:
+        return self.port or self.protocol.default_port()
+
+
+# main:
+# - debug output versions
+# - default port per protocol
+# - verify options, defaults and dependencies
+# - download --file (CRL??) -- check CRL instead of TLS certificate
+# - check DNSSEC via 8.8.8.8: require RRSIG on answer
+# - `nmap --script +ssl-enum-ciphers` for offered ciphers and protocols
+#   * check against DISALLOWED_PROTOCOLS
+# - check/load DANE
+# - `fetch_certificate` (openssl s_client output 2>$ERROR 1> $CERT ??)
+# - check required/unwanted HTTP headers
+# - check TLS renegotiation
+# - check whether server asks for client certificate (from given CA names)
+# - extract peer certificate details
+#   - check required purpose
+# - walk received chain
+# - warn against root CAs in chain
+# - check OCSP stapling
+# - "long output" of LONG_OUTPUT_ATTR / VALID_ATTRIBUTES ?
+# - check the presence of a subjectAlternativeName
+# - check the names in the certificate
+# - check the issuer / not issued by
+# - check serial
+# - check fingerprint
+# - check validity (dates) for all in chain
+#   optionally skip outdated duplicates (by "CN"? should probably be by subject)?
+#   probably should only check "shortest"/"most recent"/"best" path to a trusted CA? (i.e. skip cross-signed intermediates, ...)
+# - check cipher strength with nmap
+# - check ssl labs
+# - check peer cert OU
+# - check peer cert email
+# - check whether peer cert was verified by s_client
+# - check peer cert Signed Certificate Timestamps (SCTs)
+# - check peer cert isn't valid for a longer time than allowed (397 days / 13 months by CA browser forum?)
+# - make pretty output
+
+
+def postprocess_args(args: Arguments) -> None:
+    if args.ipv4 and args.ipv6:
+        RESULT.critical("Can't force use both IPv4 and IPv6")
+
+    if args.ignore_maximum_validity:
+        if args.maximum_validity != -1:
+            RESULT.critical("Can't use both --ignore-maximum-validity and --maximum-validity")
+    elif args.maximum_validity == -1 and args.protocol == Protocol.HTTPS:
+        args.maximum_validity = 367
+
+    if args.rootcert:
+        if args.rootcert_dir or args.rootcert_file:
+            RESULT.critical("Can't use bother --rootcert and --rootcert-dir or --rootcert-file")
+        if os.path.isdir(args.rootcert):
+            args.rootcert_dir = args.rootcert
+        else:
+            args.rootcert_file = args.rootcert
+
+    if not args.ignore_host_cn and args.host:
+        try:
+            ipaddress.ip_address(args.host)
+        except ValueError:
+            args.match = [args.host] + (args.match or [])
+
+    if not args.match:
+        # either --ignore-host-cn or args.host was an IP or verifying a file
+        RESULT.critical("Must specify at least one name to match certificate against")
+
+
+def connect(args: Arguments) -> socket.socket:
+    timeout = 5.0  # 5 seconds connect/read/write timeout should be fine
+    if args.protocol == Protocol.SMTP:
+        timeout = 15.0  # smtp servers often use delayed hello as anti-spam measure
+    if args.ipv4 or args.ipv6:
+        if args.ipv4:
+            stream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        else:
+            stream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        stream.settimeout(timeout)
+        stream.connect((args.host, args.actual_port))
+    else:
+        stream = socket.create_connection((args.host, args.actual_port), timeout=timeout)
+    return stream
+
+
+# def test_renegotiation(args: Arguments, context: OpenSSL.SSL.Context):
+#     # SSL_get_secure_renegotiation_support not available through cryptography bindings
+#     # (SSL_get_secure_renegotiation_support is a macro based on SSL_ctrl and SSL_CTRL_GET_RI_SUPPORT)
+
+
+def tls_connect(args: Arguments, context: OpenSSL.SSL.Context) -> GenericSSLClient:
+    try:
+        stream = BufferedSocket(connect(args))
+    except TimeoutError:
+        RESULT.critical(f"Timeout when trying to connect to TCP [{args.host}]:{args.actual_port}")
+    starttls = args.protocol.starttls()
+    if starttls:
+        try:
+            new_stream = starttls(args, stream)
+            if not new_stream is None:
+                stream = new_stream
+        except TimeoutError:
+            RESULT.critical(f"Timeout during STARTTLS with [{args.host}]:{args.actual_port}")
+    server_hostname: str | None
+    if args.sni:
+        server_hostname = args.sni
+    else:
+        server_hostname = None
+        try:
+            ipaddress.ip_address(args.host)
+        except ValueError:
+            # only set non-IP host as SNI
+            server_hostname = args.host
+    return GenericSSLClient(context=context, stream=stream, server_hostname=server_hostname)
+
+
+def get_x509_extensions(cert: OpenSSL.crypto.X509) -> dict[str, list[OpenSSL.crypto.X509Extension]]:
+    extensions: dict[str, list[OpenSSL.crypto.X509Extension]] = {}
+    for ndx in range(0, cert.get_extension_count()):
+        ext = cert.get_extension(ndx)
+        extensions.setdefault(ext.get_short_name().decode('ascii'), []).append(ext)
+    return extensions
+
+
+DNS_SINGLE_LABEL = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def name_matches(expected: str, allowed: str) -> bool:
+    if expected == allowed:
+        return True
+    if (
+        allowed.startswith('*.')  # wildcard SAN
+        and expected.endswith(allowed[1:])  # in subdomain
+        and DNS_SINGLE_LABEL.match(expected.removesuffix(allowed[1:]))  # only one label matches the *
+    ):
+        return True
+    # TODO:
+    # the check_ssl_cert shell script also tried using `name` as regex and matching allowed_name;
+    # given hostnames contain lots of dots ('.') that seems unwise to accept.
+    # maybe only with special syntax like a '/' prefix/wrapping?
+    return False
+
+
+def verify_peer_names(args: Arguments, peer_cert: cryptography.x509.Certificate) -> None:
+    title = peer_cert.subject.rfc4514_string()
+    cns = peer_cert.subject.get_attributes_for_oid(cryptography.x509.oid.NameOID.COMMON_NAME)
+    cn: str | None = None
+    if len(cns) == 1 and cns[0]:
+        if isinstance(cns[0].value, bytes):
+            try:
+                cn = cns[0].value.decode("ascii")
+            except ValueError:
+                RESULT.warning(f"Only ASCII common names supported as SubjectAlternativeName fallback; ignoring common name")
+        else:
+            cn = cns[0].value
+    using_cn = False
+    names: list[cryptography.x509.GeneralName] = []
+    if not args.ignore_altnames:
+        try:
+            names = list(peer_cert.extensions.get_extension_for_class(cryptography.x509.SubjectAlternativeName).value)
+            if not names:
+                RESULT.critical(f"SubjectAlternativeName extension present but empty in peer certificate {title}", abort=False)
+                return
+            for san_name in names:
+                RESULT.message(f"SAN: {san_name.value}")
+        except cryptography.x509.ExtensionNotFound:
+            pass
+    if not names:
+        if not (args.ignore_altnames or args.allow_empty_san):
+            RESULT.critical(f"Missing SubjectAlternativeName extension in peer certificate {title}", abort=False)
+            return
+        if not cn:
+            RESULT.critical(f"Not exactly one common name in peer certificate subject: {title}", abort=False)
+            return
+
+        # fake SAN data
+        using_cn = True
+        names = [cryptography.x509.DNSName(cn)]
+
+    for name in args.match:
+        ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None
+        try:
+            ip = ipaddress.ip_address(name)
+        except ValueError:
+            ip = None
+
+        if ip is None:
+            for allowed_name in names:
+                if isinstance(allowed_name, cryptography.x509.DNSName):
+                    if name_matches(name, allowed_name.value):
+                        break
+            else:
+                if not using_cn and cn and name_matches(name, cn):
+                    RESULT.warning(f"Certificate {title} not valid for {name} (CN would match but SAN present; could try --ignore-altnames)")
+                else:
+                    RESULT.critical(f"Certificate {title} not valid for {name}", abort=False)
+        else:
+            for allowed_name in names:
+                if isinstance(allowed_name, cryptography.x509.IPAddress):
+                    if isinstance(allowed_name.value, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                        if ip in allowed_name.value:
+                            break
+                    else:
+                        assert isinstance(allowed_name.value, (ipaddress.IPv4Address, ipaddress.IPv6Address))
+                        if ip == allowed_name.value:
+                            break
+            else:
+                RESULT.critical(f"Certificate not valid for IP {name}", abort=False)
+
+
+@dataclasses.dataclass
+class CacheEntry:
+    url: str
+    last_modified: datetime.datetime
+    etag: str
+    age: datetime.timedelta
+    data: bytes
+
+    @staticmethod
+    def _read(read_obj: typing.BinaryIO) -> CacheEntry | None:
+        try:
+            try:
+                url = read_obj.readline().removesuffix(b"\n").decode()
+            except UnicodeDecodeError:
+                RESULT.warning("Can't decode URL from cache file")
+                return None
+            fstat = os.fstat(read_obj.fileno())
+            hdr_begin = read_obj.tell()
+            if hdr_begin + 4 > fstat.st_size:
+                RESULT.warning("Cache file too small for header")
+                return None
+            hdr_size = struct.unpack(">L", read_obj.read(4))[0]
+            hdr_end = read_obj.tell() + hdr_size
+            if hdr_size < 10:
+                RESULT.warning("Cache file structure too old")
+                return None
+            if hdr_end > fstat.st_size:
+                RESULT.warning("Invalid header size in cache file")
+                return None
+            tstamp = struct.unpack(">Q", read_obj.read(8))[0]
+            etag = read_obj.read(struct.unpack(">H", read_obj.read(2))[0]).decode()
+            last_modified = datetime.datetime.fromtimestamp(tstamp, tz=datetime.UTC)
+            last_update = datetime.datetime.fromtimestamp(fstat.st_mtime, tz=datetime.UTC)
+            age = datetime.datetime.now(tz=datetime.UTC) - last_update
+            read_obj.seek(hdr_end, os.SEEK_SET)
+            data = read_obj.read()
+            return CacheEntry(
+                url=url,
+                last_modified=last_modified,
+                etag=etag,
+                age=age,
+                data=data,
+            )
+        except EOFError:
+            RESULT.warning(f"Unexpected EOF in cache file")
+            return None
+
+    @staticmethod
+    def _key(url: str) -> str:
+        return base64.urlsafe_b64encode(hashlib.sha256(url.encode()).digest()).rstrip(b"=").decode()
+
+    @staticmethod
+    def get(args: Arguments, url: str) -> CacheEntry | None:
+        assert not "\n" in url
+        key = CacheEntry._key(url)
+        cache_base_dir = args.cache_dir or DEFAULT_NAGIOS_STATE_DIR
+        cache_dir = os.path.join(cache_base_dir, "check_tls_service")
+        if not os.path.isdir(cache_dir):
+            RESULT.debug(f"cache directory doesn't exist yet")
+            return None
+        try:
+            with open(os.path.join(cache_dir, key), "rb") as read_obj:
+                obj = CacheEntry._read(read_obj)
+        except (FileNotFoundError, PermissionError) as exc:
+            RESULT.debug(f"Couldn't open cache file: {exc}")
+            return None
+        if obj and obj.url != url:
+            RESULT.warning(f"URL mismatch in cache entry: {obj.url!r} != {url!r}")
+            return None
+        return obj
+
+    @staticmethod
+    def touch(args: Arguments, url: str) -> None:
+        assert not "\n" in url
+        key = CacheEntry._key(url)
+        cache_base_dir = args.cache_dir or DEFAULT_NAGIOS_STATE_DIR
+        cache_dir = os.path.join(cache_base_dir, "check_tls_service")
+        try:
+            os.utime(os.path.join(cache_dir, key))
+        except OSError:
+            pass
+
+    @staticmethod
+    def put(args: Arguments, url: str, etag: str, data: bytes, last_mtime: datetime.datetime) -> None:
+        assert not "\n" in url
+        if not args.cache_dir and os.getuid() == 0:
+            RESULT.debug(f"Not writing default cache dir as root")
+            # enable cache for root only with explicit cache dir
+            return None
+        key = CacheEntry._key(url)
+        cache_base_dir = args.cache_dir or DEFAULT_NAGIOS_STATE_DIR
+        cache_dir = os.path.join(cache_base_dir, "check_tls_service")
+
+        @contextlib.contextmanager
+        def with_cache_dir() -> typing.Generator[int | None]:
+            fd_cache_dir: int | None = None
+            try:
+                fd_cache_dir = os.open(cache_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_PATH)
+            except FileNotFoundError:
+                pass
+            if fd_cache_dir is None:
+                try:
+                    os.makedirs(cache_dir, exist_ok=True)
+                except OSError as exc:
+                    RESULT.debug(f"Can't create cache dir {cache_dir!r}: {exc}")
+                try:
+                    fd_cache_dir = os.open(cache_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_PATH)
+                except OSError as exc:
+                    RESULT.debug(f"Can't open cache dir {cache_dir!r}: {exc}")
+            try:
+                yield fd_cache_dir
+            finally:
+                if not fd_cache_dir is None:
+                    os.close(fd_cache_dir)
+
+        @contextlib.contextmanager
+        def mkstemp(fd_cache_dir: int) -> typing.Generator[typing.BinaryIO | None]:
+            flags = os.O_CREAT | os.O_CLOEXEC | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY
+            mode = 0o444
+            while True:
+                suffix = secrets.token_urlsafe(6)
+                tmp_name = f"{key}.{suffix}~"
+                try:
+                    fd = os.open(tmp_name, flags=flags, mode=mode, dir_fd=fd_cache_dir)
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    RESULT.debug(f"Can't create temporary cache file: {exc}")
+                    yield None
+                    return
+                break
+
+            try:
+                with open(fd, mode="wb") as tmp_file:
+                    yield tmp_file
+            finally:
+                if sys.exception() is None:
+                    try:
+                        os.rename(tmp_name, key, src_dir_fd=fd_cache_dir, dst_dir_fd=fd_cache_dir)
+                        return
+                    except Exception as exc:
+                        RESULT.warning(f"Couldn't update cache file (renaming tmp file): {exc}")
+                        pass
+                try:
+                    os.unlink(tmp_name, dir_fd=fd_cache_dir)
+                except Exception as exc:
+                    # what are we gonna do?...
+                    RESULT.warning(f"Can't cleanup tmp file: {exc}")
+                    pass
+
+        etag_bytes = etag.encode()
+        if len(etag_bytes) > 65535:
+            etag_bytes = b""  # etag too long
+        with with_cache_dir() as fd_cache_dir:
+            if fd_cache_dir is None:
+                return
+            with mkstemp(fd_cache_dir) as tmp_file:
+                if tmp_file is None:
+                    return
+                header = struct.pack(">Q", int(last_mtime.timestamp())) + struct.pack(">H", len(etag_bytes)) + etag_bytes
+                tmp_file.write(url.encode() + b"\n" + struct.pack(">L", len(header)) + header)
+                tmp_file.write(data)
+
+
+class HTTPErrorProcessor(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request, response):
+        # need to accept 304 (outside 2xx)
+        return response
+
+
+def cached_download(args: Arguments, url: str) -> bytes | None:
+    entry = CacheEntry.get(args, url)
+    headers: dict[str, str] = {}
+    if not entry is None:
+        # if entry.age <= datetime.timedelta(hours=1):
+        #     RESULT.debug("Using cached CRL download - file recent enough")
+        #     return entry.data
+        headers["if-modified-since"] = entry.last_modified.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        if entry.etag:
+            headers["if-none-match"] = entry.etag
+
+    opener = urllib.request.build_opener(HTTPErrorProcessor)
+    resp = opener.open(urllib.request.Request(url, headers=headers))
+    with resp as resp_file:
+        if not entry is None and resp.status == 304:
+            RESULT.debug("Using cached CRL download - 304 Not modified")
+            CacheEntry.touch(args, url)  # mark file as "fresh"
+            return entry.data
+        if resp.status != 200:
+            RESULT.message(f"Failed downloading {url}: status {resp.status}")
+            return None
+        try:
+            last_mtime = datetime.datetime.strptime(resp.headers["last-modified"], "%a, %d %b %Y %H:%M:%S %Z")
+        except Exception:
+            last_mtime = datetime.datetime.now(tz=datetime.UTC)
+        data = resp_file.read()
+        RESULT.debug(f"Fetched {len(data)} bytes from {url}")
+    CacheEntry.put(args, url, resp.headers.get("etag") or "", data, last_mtime)
+    return data
+
+
+def check_crl(args: Arguments, cert: cryptography.x509.Certificate, *, optional: bool = False) -> None:
+    crls: list[str] = []
+
+    crl_dps = cert.extensions.get_extension_for_class(cryptography.x509.CRLDistributionPoints)
+    for crl_dp in crl_dps.value:
+        RESULT.debug(f"CRL DistributionPoint: {crl_dp}")
+        if not crl_dp.full_name:
+            continue
+        if isinstance(crl_dp.full_name[0], cryptography.x509.UniformResourceIdentifier):
+            RESULT.message(f"CRL: {crl_dp.full_name[0].value}")
+            crls.append(crl_dp.full_name[0].value)
+
+    if not crls:
+        if not optional:
+            RESULT.critical("Missing CLR in certificate", abort=False)
+        return
+
+    for crl_url in crls:
+        crl_data = cached_download(args, crl_url)
+        if crl_data is None:
+            continue
+        RESULT.message(f"TBD: check CRL {len(crl_data)}")
+        crl = cryptography.x509.load_der_x509_crl(crl_data)
+        # crl.is_signature_valid(first_intermediate)
+        rev = crl.get_revoked_certificate_by_serial_number(cert.serial_number)
+        if rev:
+            RESULT.critical(f"Certificate is revoked by CRL: {rev}", abort=False)
+            return
+        RESULT.debug("CRL check: good, certificate not listed")
+        break
+    else:
+        RESULT.critical("Couldn't fetch any CLR", abort=False)
+
+
+def check_chain(args: Arguments, peer_cert_and_chain: list[cryptography.x509.Certificate] | None) -> None:
+    now = datetime.datetime.now(tz=datetime.UTC)
+
+    seen_chain_certs: set[bytes] = set()
+
+    if not peer_cert_and_chain:
+        RESULT.critical("No certificates found")
+
+    for cr_ndx, cr_cert in enumerate(peer_cert_and_chain):
+        cr_subject = cr_cert.subject.rfc4514_string()
+        cr_subject_cn_l = cr_cert.subject.get_attributes_for_oid(cryptography.x509.oid.NameOID.COMMON_NAME)
+        cr_subject_cn = cr_subject_cn_l and cr_subject_cn_l[0].value or cr_subject
+        cr_issuer_o_l = cr_cert.issuer.get_attributes_for_oid(cryptography.x509.oid.NameOID.ORGANIZATION_NAME)
+        cr_issuer_o = cr_issuer_o_l and cr_issuer_o_l[0].value or cr_cert.issuer.rfc4514_string()
+        cr_valid = (cr_cert.not_valid_after_utc - now)
+        cr_valid_days = cr_valid.total_seconds() / 86400.0
+
+        RESULT.performance(f"days_chain_elem{cr_ndx+1}", f"{cr_valid.days};{args.warning};{args.critical};;")
+
+        # check for duplicates in chain
+        if cr_cert.tbs_certificate_bytes in seen_chain_certs:
+            msg = f"Chain cert #{cr_ndx} is a duplicate of an earlier certificate: {cr_subject}"
+            if args.check_chain:
+                RESULT.critical(msg, abort=False)
+            else:
+                RESULT.debug(msg)
+            continue  # skip other checks
+        seen_chain_certs.add(cr_cert.tbs_certificate_bytes)
+
+        RESULT.message(f"Chain cert #{cr_ndx}: {cr_cert.not_valid_before_utc} - {cr_cert.not_valid_after_utc}, expires in {cr_valid.days} days: {cr_subject}")
+
+        # checks against peer certificate
+        if cr_ndx == 0:
+            verify_peer_names(args, cr_cert)
+            check_crl(args, cr_cert)
+
+            # TODO: check peer certificate "purpose" (key usage) and whether key usage is marked as critical extension
+            # RESULT.debug(cr_cert.extensions.get_extension_for_class(cryptography.x509.KeyUsage))
+            # RESULT.debug(cr_cert.extensions.get_extension_for_class(cryptography.x509.ExtendedKeyUsage))
+
+            # CA/Browser Forum Baseline requirements: 6.3.2 Certificate operational periods and key pair usage periods
+            if args.maximum_validity != -1:
+                total_valid_days = (cr_cert.not_valid_after_utc - cr_cert.not_valid_before_utc).days
+                if total_valid_days > args.maximum_validity:
+                    RESULT.critical(f"Peer certificate mustn't be valid for more than {args.maximum_validity} days, but is valid for {total_valid_days} days", abort=False)
+
+            if not args.ignore_sct:  # and not args.selfsigned
+                # TODO: clients must support SCTs in the TLS handshake and in OCSP too - so maybe we should allow those to succeed as well
+                # (https://datatracker.ietf.org/doc/html/rfc9162#section-8.1.1)
+                try:
+                    pc_sct = cr_cert.extensions.get_extension_for_oid(cryptography.x509.oid.ExtensionOID.PRECERT_SIGNED_CERTIFICATE_TIMESTAMPS)
+                except cryptography.x509.extensions.ExtensionNotFound:
+                    RESULT.critical("Peer certificates has no Signed Certificate Timestamps (SCT)", abort=False)
+                else:
+                    assert isinstance(pc_sct.value, cryptography.x509.extensions.PrecertificateSignedCertificateTimestamps)
+                    RESULT.debug(f"Found {len(pc_sct.value)} Signed Certificate Timestamps (SCT) in peer certificate")
+
+        # check for root CAs in chain
+        if cr_ndx > 0 and cr_cert.issuer == cr_cert.subject:
+            msg = f"Chain cert #{cr_ndx}: certificate is self signed (i.e. a root CA); shouldn't be in chain: {cr_subject}"
+            if args.check_chain:
+                RESULT.critical(msg, abort=False)
+            else:
+                RESULT.debug(msg)
+
+        # check "valid" times
+        if now < cr_cert.not_valid_before_utc:
+            RESULT.critical(f"Chain cert #{cr_ndx} {cr_subject} not valid yet (not valid before: {cr_cert.not_valid_before_utc})", abort=False)
+        elif now > cr_cert.not_valid_after_utc:
+            RESULT.critical(f"Chain cert #{cr_ndx} {cr_subject} expired (not valid after: {cr_cert.not_valid_after_utc})", abort=False)
+        elif cr_valid_days < args.critical:
+            RESULT.critical(f"Chain cert #{cr_ndx} {cr_subject} expires in {cr_valid.days} days (not valid after: {cr_cert.not_valid_after_utc})", abort=False)
+        elif cr_valid_days < args.warning:
+            RESULT.warning(f"Chain cert #{cr_ndx} {cr_subject} expires in {cr_valid.days} days (not valid after: {cr_cert.not_valid_after_utc})")
+
+        if cr_ndx == 0 and RESULT.code is None:
+            RESULT.ok(
+                f"{args.host}:{args.actual_port}, {args.protocol}, "
+                f"x509 certificate {cr_subject_cn!r} from {cr_issuer_o!r} "
+                f"valid until {cr_cert.not_valid_after_utc} (expires in {cr_valid.days} days)"
+            )
+
+
+def verify_file(args: Arguments) -> None:
+    with open(args.file, "rb") as file:
+        file_data = file.read()
+    peer_certs = []
+    BEGIN = b"-----BEGIN CERTIFICATE-----"
+    END = b"-----END CERTIFICATE-----"
+    while True:
+        try:
+            begin = file_data.index(BEGIN)
+            file_data = file_data[begin:]
+            end = file_data.index(END) + len(END)
+            peer_certs.append(cryptography.x509.load_pem_x509_certificate(file_data[:end]))
+            file_data = file_data[end:]
+        except ValueError:
+            break
+    check_chain(args, peer_certs)
+
+    # TODO: verify against (trusted) root certs?
+
+
+def main() -> None:
+    # import shlex
+    # RESULT.message(shlex.join(sys.argv))
+    args = Arguments.parse_args()
+    RESULT.debug_level = args.debug
+    postprocess_args(args)
+
+    if args.file:
+        return verify_file(args)
+
+    # SSL context
+    context = OpenSSL.SSL.Context(OpenSSL.SSL.TLS_CLIENT_METHOD)
+    if args.rootcert_dir or args.rootcert_file:
+        context.load_verify_locations(cafile=args.rootcert_file or None, capath=args.rootcert_dir or None)
+    else:
+        context.set_default_verify_paths()
+    context.set_verify(OpenSSL.SSL.VERIFY_PEER)
+
+    if args.no_ssl2:
+        context.set_options(OpenSSL.SSL.OP_NO_SSLv2)
+    if args.no_ssl3:
+        context.set_options(OpenSSL.SSL.OP_NO_SSLv3)
+    if args.no_tls1:
+        context.set_options(OpenSSL.SSL.OP_NO_TLSv1)
+    if args.no_tls1_1:
+        context.set_options(OpenSSL.SSL.OP_NO_TLSv1_1)
+    if args.no_tls1_2:
+        context.set_options(OpenSSL.SSL.OP_NO_TLSv1_2)
+    if args.no_tls1_3:
+        context.set_options(OpenSSL.SSL.OP_NO_TLSv1_3)
+
+    if args.clientcert or args.clientkey:
+        if not (args.clientcert and args.clientkey):
+            RESULT.critical("must specify either both or none of client key + cert")
+        context.use_certificate_chain_file(args.clientcert)
+        context.use_privatekey_file(args.clientkey)
+
+    conn = tls_connect(args, context)
+    conn.do_handshake()
+
+    # test_renegotiation(args, context)
+
+    check_chain(args, conn.get_peer_cert_chain())
+
+
+with NagiosResult.run() as RESULT:
+    main()
